@@ -790,7 +790,9 @@ class NPUModelRunner(GPUModelRunner):
                     req_state.prev_num_draft_len = 0
 
         self._apply_pp_sampled_tokens_from_scheduler_output(scheduler_output)
-        return super()._update_states(scheduler_output)
+        sampling_metadata = super()._update_states(scheduler_output)
+        self._track_tmp_encoder_cache_refs(scheduler_output)
+        return sampling_metadata
 
     def _pad_query_start_loc_for_fia(
         self,
@@ -840,6 +842,19 @@ class NPUModelRunner(GPUModelRunner):
         query_start_loc.copy_to_gpu()
 
         return num_reqs_padded
+
+    def _track_tmp_encoder_cache_refs(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        score_encoder_cache_config = get_ascend_config().score_encoder_cache_config
+        if not score_encoder_cache_config.enabled:
+            return
+
+        for new_req_data in scheduler_output.scheduled_new_reqs:
+            for mm_feature in new_req_data.mm_features:
+                cur_hash = mm_feature.identifier
+                self.cached.setdefault(cur_hash, set()).add(new_req_data.req_id)
 
     def free_tmp_cache(self, req_id, request):
         if request is None:
@@ -986,11 +1001,9 @@ class NPUModelRunner(GPUModelRunner):
         self,
         mm_hash: str,
         output: torch.Tensor,
-        scheduler_output: "SchedulerOutput",
+        ec_manager_metadata: Any | None,
+        free_encoder_mm_hashes: list[str],
     ) -> None:
-        ec_manager_metadata = self._get_score_encoder_cache_metadata(
-            scheduler_output
-        )
         promoting_mm_hashes = (
             ec_manager_metadata.promoting_mm_hashes
             if ec_manager_metadata is not None
@@ -1008,7 +1021,7 @@ class NPUModelRunner(GPUModelRunner):
 
         if (
             mm_hash in promoting_mm_hashes
-            and mm_hash not in scheduler_output.free_encoder_mm_hashes
+            and mm_hash not in free_encoder_mm_hashes
         ):
             self.encoder_cache[mm_hash] = output
         else:
