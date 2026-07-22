@@ -81,6 +81,7 @@ class EmbCacheStats:
 class ScoreEncoderCacheManagerMetadata(EncoderCacheManagerMetadata):
     promoting_mm_hashes: list[str]
     cpu_get_encoder_mm_hashes: list[str]
+    cpu_free_encoder_mm_hashes: list[str]
 
 
 class ScoreEncoderCacheManager(EncoderCacheManager):
@@ -146,6 +147,7 @@ class ScoreEncoderCacheManager(EncoderCacheManager):
         # Actions to execute in the current round
         self.promoting: list[str] = []  # mm_hashes to be promoted from CPU -> NPU
         self.cpu_get_encoder_mm_hashes: list[str] = []  # mm_hashes whose embeddings need to be prefetched from CPU
+        self.cpu_free_get_encoder_mm_hashes: list[str] = []  # mm_hashes whose embeddings need to be freed from CPU
 
         # ---------------- Load model config (used to estimate theoretical compute cost) ----------------
         self.attn_heads = vllm_config.model_config.hf_config.vision_config.num_heads
@@ -334,7 +336,7 @@ class ScoreEncoderCacheManager(EncoderCacheManager):
             mm_hash, ent = self.cpu_freeable.popitem(last=False)
             del self.cached[mm_hash]
             del self.cpu_cache[mm_hash]
-            self.freed.append(mm_hash)
+            self.free_get_encoder_mm_hashes.append(mm_hash)
             self.cpu_num_free_slots += ent.num_embeds
             self.stats.increment(
                 evict_cpu=1,
@@ -418,14 +420,12 @@ class ScoreEncoderCacheManager(EncoderCacheManager):
             self.npu_num_freeable_slots += self.npu_cache[mm_hash].num_embeds
 
     def get_manager_metadata(self) -> "ScoreEncoderCacheManagerMetadata":
-        promoting = self.promoting
-        self.promoting = []
-        cpu_get_encoder_mm_hashes = self.cpu_get_encoder_mm_hashes
-        self.cpu_get_encoder_mm_hashes = []
-        return ScoreEncoderCacheManagerMetadata(
-            promoting_mm_hashes=promoting,
-            cpu_get_encoder_mm_hashes=cpu_get_encoder_mm_hashes,
+        metadata = ScoreEncoderCacheManagerMetadata(
+        promoting_mm_hashes=self.get_promoting_mm_hashes(),
+        cpu_get_encoder_mm_hashes=self.get_cpu_get_encoder_mm_hashes(),
+        cpu_free_encoder_mm_hashes=self.get_free_get_encoder_mm_hashes(),
         )
+        return metadata
 
     def get_promoting_mm_hashes(self) -> list[str]:
         promoting = self.promoting
@@ -436,6 +436,11 @@ class ScoreEncoderCacheManager(EncoderCacheManager):
         cpu_get_encoder_mm_hashes = self.cpu_get_encoder_mm_hashes
         self.cpu_get_encoder_mm_hashes = []
         return cpu_get_encoder_mm_hashes
+
+    def get_free_get_encoder_mm_hashes(self) -> list[str]:
+        cpu_free_get_encoder_mm_hashes = self.cpu_free_get_encoder_mm_hashes
+        self.cpu_free_get_encoder_mm_hashes = []
+        return cpu_free_get_encoder_mm_hashes
 
     def _check_invariant(self):
         """
