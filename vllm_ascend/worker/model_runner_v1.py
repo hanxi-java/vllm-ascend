@@ -38,6 +38,7 @@ import torch.nn as nn
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
+from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
 from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
@@ -1043,11 +1044,9 @@ class NPUModelRunner(GPUModelRunner):
         self,
         mm_hash: str,
         output: torch.Tensor,
-        scheduler_output: "SchedulerOutput",
+        ec_manager_metadata: "EncoderCacheManagerMetadata | None",
+        free_encoder_mm_hashes: list[str],
     ) -> None:
-        ec_manager_metadata = self._get_score_encoder_cache_metadata(
-            scheduler_output
-        )
         promoting_mm_hashes = (
             ec_manager_metadata.promoting_mm_hashes
             if ec_manager_metadata is not None
@@ -1065,7 +1064,7 @@ class NPUModelRunner(GPUModelRunner):
 
         if (
             mm_hash in promoting_mm_hashes
-            and mm_hash not in scheduler_output.free_encoder_mm_hashes
+            and mm_hash not in free_encoder_mm_hashes
         ):
             self.encoder_cache[mm_hash] = output
         else:
