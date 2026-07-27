@@ -121,6 +121,7 @@ from vllm_ascend.compilation.acl_graph import (
     update_full_graph_params,
 )
 from vllm_ascend.distributed.utils import get_decode_context_model_parallel_world_size
+from vllm_ascend.ec_manager.encoder_cache_store import CPUEncoderCacheStore
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
@@ -569,7 +570,7 @@ class NPUModelRunner(GPUModelRunner):
         self._mamba_copy_bufs: Any | None = None
         # Score encoder cache state.
         self.tmp_encoder_cache: dict[str, torch.Tensor] = {}
-        self.cpu_encoder_cache: dict[str, torch.Tensor] = {}
+        self.cpu_encoder_cache_store = CPUEncoderCacheStore()
         self.cached: dict[str, set[str]] = {}
         self._pending_encoder_cache_copies: deque[
             tuple[torch.Tensor, torch.npu.Event]
@@ -899,7 +900,7 @@ class NPUModelRunner(GPUModelRunner):
         ec_manager_metadata = self._get_score_encoder_cache_metadata(scheduler_output)
         if ec_manager_metadata is None:
             for mm_hash in scheduler_output.free_encoder_mm_hashes:
-                self.encoder_cache.pop(mm_hash, None)
+                self.cpu_encoder_cache_store.pop(mm_hash)
             return
 
         # Free the cached encoder outputs.
@@ -912,7 +913,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.cpu_encoder_cache.pop(mm_hash, None)
 
         for mm_hash in promoting_mm_hashes:
-            cpu_value = self.cpu_encoder_cache.get(mm_hash, None)
+            cpu_value = self.cpu_encoder_cache_store.get(mm_hash)
             if cpu_value is None:
                 continue
 
@@ -923,7 +924,7 @@ class NPUModelRunner(GPUModelRunner):
         for mm_hash in cpu_get_encoder_mm_hashes:
             if mm_hash in self.encoder_cache or mm_hash in self.tmp_encoder_cache:
                 continue
-            cpu_value = self.cpu_encoder_cache.get(mm_hash, None)
+            cpu_value = self.cpu_encoder_cache_store.get(mm_hash)
             if cpu_value is None:
                 continue
             self.tmp_encoder_cache[mm_hash] = self._copy_cpu_encoder_cache_to_device(
@@ -942,7 +943,7 @@ class NPUModelRunner(GPUModelRunner):
         if not get_score_encoder_cache_config(self.vllm_config).enabled:
             return None
 
-        cpu_value = self.cpu_encoder_cache.get(mm_hash, None)
+        cpu_value = self.cpu_encoder_cache_store.get(mm_hash)
         if cpu_value is None:
             return None
 
@@ -961,7 +962,7 @@ class NPUModelRunner(GPUModelRunner):
             return True
         return (
             get_score_encoder_cache_config(self.vllm_config).enabled
-            and mm_hash in self.cpu_encoder_cache
+            and mm_hash in self.cpu_encoder_cache_store
         )
 
     def _get_encoder_cache_view(self) -> _EncoderCacheView:
@@ -1015,9 +1016,12 @@ class NPUModelRunner(GPUModelRunner):
             self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
             return
 
+        if mm_hash in self.cpu_encoder_cache_store.contains(mm_hash):
+            return
+
         staging = torch.empty_like(output, device="cpu", pin_memory=True)
         staging.copy_(output.detach(), non_blocking=True)
-        self.cpu_encoder_cache[mm_hash] = staging
+        self.cpu_encoder_cache_store.put(mm_hash, staging)
 
         if (
             mm_hash in promoting_mm_hashes
