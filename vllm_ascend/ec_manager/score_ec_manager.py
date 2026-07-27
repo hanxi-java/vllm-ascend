@@ -7,7 +7,7 @@ from vllm.logger import init_logger
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.request import Request
 
-from vllm_ascend.ascend_config import get_score_encoder_cache_config
+from vllm_ascend.ascend_config import get_ascend_config, get_score_encoder_cache_config
 
 logger = init_logger(__name__)
 
@@ -45,9 +45,10 @@ class ScoreEncoderCacheManager(EncoderCacheManager):
        from occupying the cache for too long
     """
 
-    def __init__(self, cache_size: int, vllm_config: VllmConfig):
+    def __init__(self, cache_size: int):
         super().__init__(cache_size)
 
+        vllm_config = get_ascend_config().vllm_config
         score_encoder_cache_config = get_score_encoder_cache_config(vllm_config)
         # ---------------- NPU cache ----------------
         self.cache_size = cache_size

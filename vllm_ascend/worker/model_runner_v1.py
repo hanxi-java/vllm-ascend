@@ -36,6 +36,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.cuda_graph import CUDAGraphStat
+from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
@@ -1003,7 +1004,7 @@ class NPUModelRunner(GPUModelRunner):
         self,
         mm_hash: str,
         output: torch.Tensor,
-        ec_manager_metadata: Any | None,
+        ec_manager_metadata: "EncoderCacheManagerMetadata | None",
         free_encoder_mm_hashes: list[str],
     ) -> None:
         promoting_mm_hashes = (
@@ -1017,7 +1018,7 @@ class NPUModelRunner(GPUModelRunner):
             self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
             return
 
-        if mm_hash in self.cpu_encoder_cache_store.contains(mm_hash):
+        if self.cpu_encoder_cache_store.contains(mm_hash):
             return
 
         staging = torch.empty_like(output, device="cpu", pin_memory=True)
