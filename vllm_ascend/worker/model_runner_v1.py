@@ -906,8 +906,9 @@ class NPUModelRunner(GPUModelRunner):
         # Free the cached encoder outputs.
         promoting_mm_hashes = ec_manager_metadata.promoting_mm_hashes
         cpu_get_encoder_mm_hashes = ec_manager_metadata.cpu_get_encoder_mm_hashes
+        cpu_free_encoder_mm_hashes = ec_manager_metadata.cpu_free_encoder_mm_hashes
 
-        for mm_hash in scheduler_output.free_encoder_mm_hashes:
+        for mm_hash in cpu_free_encoder_mm_hashes:
             value = self.encoder_cache.pop(mm_hash, None)
             if value is None and mm_hash not in promoting_mm_hashes:
                 self.cpu_encoder_cache.pop(mm_hash, None)
