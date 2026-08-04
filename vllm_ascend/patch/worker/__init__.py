@@ -73,3 +73,8 @@ import vllm_ascend.patch.worker.patch_v2.patch_dflash_speculator  # noqa
 
 # only patch routed experts capture in main2main.
 import vllm_ascend.patch.worker.patch_routed_experts_capture  # noqa
+
+# registry 工厂 patch (worker 进程侧也需要, 用于实例化 receiver cache)
+import vllm_ascend.patch.platform.patch_mm_custom_cache  # noqa
+# _execute_mm_encoder 集成: resize 缓存命中注入 / miss 回填
+import vllm_ascend.patch.worker.patch_mm_resize_cache  # noqa
