@@ -23,7 +23,6 @@ _HASH_ALGORITHM = "blake3"
 def build_resize_cache_key(resized_tensor: torch.Tensor, model_id: str) -> str:
     """由 (resize 后张量, 模型信息, 类型标记) 生成缓存 key。"""
     return MultiModalHasher.hash_kwargs(
-        _HASH_ALGORITHM,
         model_id=model_id,           # 成分 2: 模型信息
         cache_type=RESIZE_CACHE_TAG,  # 成分 3: 缓存类型标记
         image=resized_tensor,         # 成分 1: resize 后的张量

@@ -57,7 +57,7 @@ from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorRole,
 )
 from vllm.distributed.parallel_state import get_world_group
-from vllm.logger import init_logger
+from vllm.logger import logger
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend import (
     MemcacheBackend,
@@ -72,7 +72,6 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.request import Request
 
-logger = init_logger(__name__)
 
 # level 2 (resize cache) 的门控值, 与 MultiLevelEncoderCacheManager 一致
 _L2_SERVED_MODEL_NAME = "qwenvl"
@@ -139,6 +138,7 @@ class ECMemcacheConnector(ECConnectorBase):
             #       (key=resize_key)。scheduler 侧在此预先算好 resize_key,
             #       避免 worker 为回填重新触碰 pixel_values。
             self._mm_hashes_need_saves: dict[str, str | None] = {}
+            # self._store: OrderedDict[str, torch.Tensor] = OrderedDict()
         elif role == ECConnectorRole.WORKER:
             # 数据面 client: embedding 的实际读写
             self._backend = MemcacheBackend(vllm_config.parallel_config)
@@ -176,6 +176,14 @@ class ECMemcacheConnector(ECConnectorBase):
             if identifier in self._full_pixel_hits or identifier in self._resized_pixel_hits:
                 continue
 
+            # resized = extract_resized_tensor(feature.data)
+            # resize_key = build_resize_cache_key(resized, self._model_id)
+            # cached = self._store.get(resize_key)
+            # if cached is None:
+            #     self._store[resize_key] = resized.clone()
+            # else:
+            #     is_same = torch.equal(resized, cached)
+            #     logger.info("EC is is_same=%r", is_same)
             # L1: key = identifier (mm_hash)
             if self._backend.exists([identifier]) == [1]:
                 self._full_pixel_hits.add(identifier)
@@ -186,6 +194,7 @@ class ECMemcacheConnector(ECConnectorBase):
             # L2: key = resize_cache_key, 仅 qwenvl 门控内启用
             if self._l2_enabled and feature.data is not None:
                 resized = extract_resized_tensor(feature.data)
+                logger.info("EC RESIZED SHAPE: resize_shape=%r", resized.shape,)
                 if resized is not None:
                     resize_key = build_resize_cache_key(resized, self._model_id)
                     if self._backend.exists([resize_key]) == [1]:
