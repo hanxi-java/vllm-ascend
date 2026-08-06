@@ -64,7 +64,11 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_b
 )
 from vllm_ascend.distributed.ec_transfer.resize_cache_key import (
     build_resize_cache_key,
+    extract_image_grid,
     extract_resized_tensor,
+)
+from vllm_ascend.distributed.ec_transfer.tensor_similarity import (
+    compare_tensors,
 )
 
 if TYPE_CHECKING:
@@ -89,6 +93,19 @@ class ECMemcacheConnectorMetadata(ECConnectorMetadata):
 
     loads: list[tuple[str, str]] = field(default_factory=list)
     saves: dict[str, str | None] = field(default_factory=dict)
+
+
+@dataclass
+class _ResizedEntry:
+    """调试注册表条目: identifier 对应的 resized 张量及尺寸信息。
+
+    grid 为 image_grid_thw (t, h, w, patch 计数), 调度阶段原始图片
+    (PIL/URL) 已不保留, 无法拿到文件名, 用 grid 作图片尺寸标识。
+    """
+
+    tensor: torch.Tensor
+    grid: tuple[int, ...] | None
+    request_id: str
 
 
 class ECMemcacheConnector(ECConnectorBase):
@@ -118,6 +135,11 @@ class ECMemcacheConnector(ECConnectorBase):
             self._full_pixel_hit_count = 0
             self._resized_pixel_hit_count = 0
             self._miss_count = 0
+            # ── 调试: identifier → resized 张量注册表 ──
+            # 缓存所有首次见到的 resized 张量; 新 identifier 到来时与表内
+            # 所有条目做相似性比较 (余弦相似度 + 相对误差), 结果打日志。
+            # 注意: 无淘汰, 仅用于短时调试, 长期运行会持续增长内存。
+            self._resized_registry: dict[str, _ResizedEntry] = {}
             # ── 本步的 loads/saves 登记簿 (build_connector_meta 打包下发后清空) ──
             #
             # _mm_hashes_need_loads: 本步缓存命中、需要 worker 从 memcache
@@ -176,14 +198,13 @@ class ECMemcacheConnector(ECConnectorBase):
             if identifier in self._full_pixel_hits or identifier in self._resized_pixel_hits:
                 continue
 
-            # resized = extract_resized_tensor(feature.data)
-            # resize_key = build_resize_cache_key(resized, self._model_id)
-            # cached = self._store.get(resize_key)
-            # if cached is None:
-            #     self._store[resize_key] = resized.clone()
-            # else:
-            #     is_same = torch.equal(resized, cached)
-            #     logger.info("EC is is_same=%r", is_same)
+            resized = extract_resized_tensor(feature.data)
+
+            # 调试: 登记 resized 张量并与历史条目做相似性比较
+            self._register_and_compare_resized(
+                request.request_id, identifier, feature.data, resized
+            )
+
             # L1: key = identifier (mm_hash)
             if self._backend.exists([identifier]) == [1]:
                 self._full_pixel_hits.add(identifier)
@@ -192,22 +213,65 @@ class ECMemcacheConnector(ECConnectorBase):
                 continue
 
             # L2: key = resize_cache_key, 仅 qwenvl 门控内启用
-            if self._l2_enabled and feature.data is not None:
-                resized = extract_resized_tensor(feature.data)
-                logger.info("EC RESIZED SHAPE: resize_shape=%r", resized.shape,)
-                if resized is not None:
-                    resize_key = build_resize_cache_key(resized, self._model_id)
-                    if self._backend.exists([resize_key]) == [1]:
-                        self._resized_pixel_hits[identifier] = resize_key
-                        self._resized_pixel_hit_count += 1
-                        logger.info(
-                            "EC RESIZED-PIXEL HIT (sched): resize_key=%s mm_hash=%s",
-                            resize_key,
-                            identifier,
-                        )
+            if self._l2_enabled and resized is not None:
+                logger.info("EC RESIZED SHAPE: resize_shape=%r", resized.shape)
+                resize_key = build_resize_cache_key(resized, self._model_id)
+                if self._backend.exists([resize_key]) == [1]:
+                    self._resized_pixel_hits[identifier] = resize_key
+                    self._resized_pixel_hit_count += 1
+                    logger.info(
+                        "EC RESIZED-PIXEL HIT (sched): resize_key=%s mm_hash=%s",
+                        resize_key,
+                        identifier,
+                    )
 
         # 不做延迟调度 (memcache 查询是同步的, 结果立即可用)
         return True
+
+    def _register_and_compare_resized(
+        self,
+        request_id: str,
+        identifier: str,
+        item,
+        resized: torch.Tensor | None,
+    ) -> None:
+        """调试: 登记 identifier 的 resized 张量, 并与注册表内所有历史
+        条目两两做相似性比较 (余弦相似度 + 相对误差), 结果打日志。
+
+        同一 identifier 只登记/比较一次; 形状不一致的条目对仅记录形状,
+        不做逐元素数值比较。
+        """
+        if resized is None or identifier in self._resized_registry:
+            return
+        grid = extract_image_grid(item) if item is not None else None
+        for other_id, entry in self._resized_registry.items():
+            sim = compare_tensors(resized, entry.tensor)
+            logger.info(
+                "EC RESIZED SIMILARITY: req=%s new=%s(shape=%s grid=%s) "
+                "vs cached=%s(req=%s shape=%s grid=%s) | %s",
+                request_id,
+                identifier,
+                tuple(resized.shape),
+                grid,
+                other_id,
+                entry.request_id,
+                sim.shape_b,
+                entry.grid,
+                sim.format(),
+            )
+            if sim.top_errors:
+                logger.info(
+                    "EC RESIZED TOP-ERRORS: new=%s vs cached=%s (top-%d by abs_err)\n%s",
+                    identifier,
+                    other_id,
+                    len(sim.top_errors),
+                    sim.format_top_errors(),
+                )
+        self._resized_registry[identifier] = _ResizedEntry(
+            tensor=resized.detach().cpu(),
+            grid=grid,
+            request_id=request_id,
+        )
 
     def has_cache_item(self, identifier: str) -> bool:
         """scheduler.py:1609 的判定: 命中则跳过 ViT 调度, 转外部加载。"""
