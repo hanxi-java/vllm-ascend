@@ -95,6 +95,7 @@ from vllm.logger import logger
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend import (
     MemcacheBackend,
+    MmcDirect,
 )
 from vllm_ascend.distributed.ec_transfer.mm_item_extract import (
     extract_image_grid,
@@ -765,7 +766,7 @@ class ECMemcacheConnector(ECConnectorBase):
         t = tensor.contiguous()
         # CPU 内存的 put 是同步拷贝, 无 _ec_put 的计算流/SDMA 队列同步
         # 问题; 只需保证 t 存活到 put 返回
-        self._backend.put([key], [[t.data_ptr()]], [[t.nbytes]])
+        self._backend.put([key], [[t.data_ptr()]], [[t.nbytes]], MmcDirect.COPY_H2G.value)
         logger.info("EC RESIZED PUT: key=%s nbytes=%d shape=%r",
                     key, t.nbytes, tuple(t.shape))
 
@@ -787,7 +788,7 @@ class ECMemcacheConnector(ECConnectorBase):
                 "EC RESIZED GET size mismatch: key=%s meta=%r/%s nbytes=%d "
                 "store_nbytes=%d", key, shape, dtype, buf.nbytes, nbytes)
             return None
-        res = self._backend.get([key], [[buf.data_ptr()]], [[nbytes]])
+        res = self._backend.get([key], [[buf.data_ptr()]], [[nbytes]], MmcDirect.COPY_G2H.value)
         if res is None or (res and res[0] != 0):
             logger.warning("EC RESIZED GET failed: key=%s res=%s", key, res)
             return None
