@@ -37,7 +37,7 @@
            写入 memcache (淘汰随 memcache 自治), scheduler 本地只留
            _mm_hash_to_resized_meta 字典 (mm_hash → (shape, dtype))
            作枚举与读回重建用; 新请求 L1 未命中后与表内形状相同的
-           条目逐一读回并计算 patch 灰度平面 SSIM (候选灰度平面用
+           条目批量读回并逐一计算 patch 灰度平面 SSIM (候选灰度平面用
            查询 grid 现算, 形状对不上的条目被自然跳过; 逐次计时打日志),
            得分 ≥ EC_SSIM_MIN_SCORE(默认 0.99) 的候选按得分降序取首个
            exists 确认者复用其 L1 条目; data_range 由
@@ -270,6 +270,15 @@ class ECMemcacheConnector(ECConnectorBase):
             self._ssim_data_range: float = float(
                 os.getenv("EC_SSIM_DATA_RANGE", str(DEFAULT_DATA_RANGE)))
             #
+            # _resized_get_chunk: resized 张量批读的分块大小, 环境变量
+            #   EC_RESIZED_GET_CHUNK 可调 (默认 32)。单张 resized 张量
+            #   (pixel_values) 可达 ~20MB, 一次性读回全部候选会把
+            #   scheduler 进程 CPU 峰值内存推高数 GB (ssim matcher 的
+            #   候选集可能是整个同形状注册表), 故按块批读; SDK 对 batch
+            #   大小无硬上限, 分块纯粹为约束本地内存峰值。
+            self._resized_get_chunk: int = int(
+                os.getenv("EC_RESIZED_GET_CHUNK", "32"))
+            #
             # _mm_hash_to_resized_meta: 历史图片 resized 张量的本地元信息
             #   (测试用), mm_hash → (shape, dtype)。resized 张量本身以
             #   "resized_" 前缀 key 写入 memcache (见 _ssim_register),
@@ -345,19 +354,43 @@ class ECMemcacheConnector(ECConnectorBase):
         (scheduler.py:838), 是唯一能同时拿到 identifier 与
         pixel_values (算 pHash) 的标准接缝。
         """
+        # 两段式: 先收集本步全部待查 identifier, 一次性批量 exists (结果
+        # 位置与收集顺序一一对应), 再逐个处理 L1 命中登记 / L2 查找。同一
+        # identifier 只查一次: 原逐条路径中重复项在首次 exists 命中后被
+        # _mm_hash_hits 跳过, 这里用 seen 集在收集期等价跳过, 避免
+        # 批量结果里对重复键重复计数。
+        pending_features: list = []
+        seen: set[str] = set()
         for feature in request.mm_features:
             current_image_mm_hash = feature.identifier
-            if current_image_mm_hash in self._mm_hash_hits or current_image_mm_hash in self._current_mm_hash_to_hit_mm_hash:
+            if (current_image_mm_hash in self._mm_hash_hits
+                    or current_image_mm_hash in self._current_mm_hash_to_hit_mm_hash
+                    or current_image_mm_hash in seen):
                 continue
+            seen.add(current_image_mm_hash)
+            pending_features.append(feature)
 
-
+        exists_res = (
+            self._backend.exists([f.identifier for f in pending_features])
+            if pending_features else []
+        )
+        if not exists_res and pending_features:
+            # 防御: SDK 异常返回空时按全部未命中处理 (与单 key 路径把
+            # exists != 1 当未命中、继续走 L2 的语义一致)
+            exists_res = [0] * len(pending_features)
+        if pending_features:
+            # 批量生效观测: 一次 exists 覆盖本步全部待查条目 (改造前为
+            # 逐条单 key 查询), 日志里 keys 数即批量规模
+            logger.info("EC BATCH EXISTS: keys=%d", len(pending_features))
+        for feature, existed in zip(pending_features, exists_res):
+            current_image_mm_hash = feature.identifier
             # 调试，该方法仅做过程问题定位: 登记 resized 张量并与历史条目做相似性比较.
             # self._register_and_compare_resized(
             #     request.request_id, identifier, feature.data, resized
             # )
 
             # L1: key = identifier (mm_hash)
-            if self._backend.exists([current_image_mm_hash]) == [1]:
+            if existed == 1:
                 self._mm_hash_hits.add(current_image_mm_hash)
                 self._full_pixel_hit_count += 1
                 logger.info("EC FULL-PIXEL HIT (sched): current mm_hash=%s", current_image_mm_hash)
@@ -524,7 +557,8 @@ class ECMemcacheConnector(ECConnectorBase):
     ) -> None:
         """similarity 查找: pHash → banding 收集候选 → hamming 升序依次过
         阈值 / grid 门控 / exists 确认, 首个通过者命中 (含 hamming=0
-        的精确匹配)。命中后按候选图的 identifier 复用其 L1 条目;
+        的精确匹配)。exists 确认对全部候选一次批量完成 (结果位置与
+        候选一一对应)。命中后按候选图的 identifier 复用其 L1 条目;
         候选 exists 失败只跳过, 索引软状态不会导致错命中。
         """
         result = self._compute_phash(current_image_mm_hash, item, resized)
@@ -532,10 +566,19 @@ class ECMemcacheConnector(ECConnectorBase):
             return
         phash, grid = result
 
-        # 候选按 hamming 距离升序, 首个通过 exists 确认者命中
-        for dist, candidate_phash, candidate_mm_hash in self._phash_candidates(
-                phash, grid, exclude=current_image_mm_hash):
-            if self._backend.exists([candidate_mm_hash]) != [1]:
+        # 候选按 hamming 距离升序, 首个通过 exists 确认者命中。批量 exists
+        # 一次覆盖全部候选 (候选列表由 _phash_candidates 整体物化, 无惰性
+        # 求值问题), 结果位置与候选一一对应; 与逐候选确认到首个命中即停
+        # 的旧语义一致, 只是对首个命中之后的候选也多发了只读查询。
+        candidates = self._phash_candidates(
+            phash, grid, exclude=current_image_mm_hash)
+        if not candidates:
+            return
+        # 防御: SDK 异常返回空时 zip 取不到任何命中, 等价于全未命中
+        exists_res = self._backend.exists([c for _, _, c in candidates]) or []
+        for (dist, candidate_phash, candidate_mm_hash), existed in zip(
+                candidates, exists_res):
+            if existed != 1:
                 continue  # 候选的 L1 条目未回填完成 / 已被淘汰: 跳过
             self._record_l2_hit(current_image_mm_hash, candidate_mm_hash,
                                 exact=(dist == 0))
@@ -560,15 +603,23 @@ class ECMemcacheConnector(ECConnectorBase):
         grid: tuple[int, ...],
         log_tag: str,
     ) -> list[tuple[float, str]]:
-        """对候选逐一 SSIM 打分: memcache 读回 resized 张量 → 用查询
-        grid 现算灰度平面 → ssim_score (逐次 perf_counter 计时打日志);
-        返回得分 ≥ 阈值的 [(score, candidate_mm_hash)] (未排序)。
-        读回失败 / 形状对不上的候选跳过。
+        """对候选逐一 SSIM 打分: 候选 resized 张量一次性批量读回 (结果
+        位置与候选一一对应, 见 _resized_get_multi), 再用查询 grid 现算
+        灰度平面 → ssim_score (逐次 perf_counter 计时打日志); 返回得分
+        ≥ 阈值的 [(score, candidate_mm_hash)] (未排序)。读回失败 / 形状
+        对不上的候选跳过。计时口径: 批量读回单独计时 (BATCH-GET 日志),
+        逐候选 elapsed 仅含灰度平面与 SSIM 计算 (原逐候选计时含网络
+        读回耗时)。
         """
         over_threshold: list[tuple[float, str]] = []
-        for candidate_mm_hash in candidate_mm_hashes:
+        # 一次性批量读回全部候选的 resized 张量 (结果位置与候选一一对应),
+        # 取代原来的逐候选 batch_get_key_info + get 两轮网络往返
+        t_batch = time.perf_counter()
+        candidate_resized_list = self._resized_get_multi(candidate_mm_hashes)
+        batch_ms = (time.perf_counter() - t_batch) * 1e3
+        for candidate_mm_hash, candidate_resized in zip(
+                candidate_mm_hashes, candidate_resized_list):
             t0 = time.perf_counter()
-            candidate_resized = self._resized_get(candidate_mm_hash)
             if candidate_resized is None:
                 continue  # resized 条目未回填完成 / 已被淘汰: 跳过
             candidate_gray = patch_gray_plane(candidate_resized, grid,
@@ -589,6 +640,9 @@ class ECMemcacheConnector(ECConnectorBase):
             )
             if score >= self._ssim_threshold:
                 over_threshold.append((score, candidate_mm_hash))
+        if candidate_mm_hashes:
+            logger.info("%s BATCH-GET: candidates=%d elapsed=%.3fms",
+                        log_tag, len(candidate_mm_hashes), batch_ms)
         return over_threshold
 
     def _first_existing_candidate(
@@ -596,9 +650,19 @@ class ECMemcacheConnector(ECConnectorBase):
         over_threshold: list[tuple[float, str]],
     ) -> tuple[float, str] | None:
         """得分降序取首个 L1 条目 exists 确认的候选; 无则 None
-        (候选条目未回填完成 / 已被淘汰时取次优)。"""
-        for score, candidate_mm_hash in sorted(over_threshold, key=lambda s: -s[0]):
-            if self._backend.exists([candidate_mm_hash]) == [1]:
+        (候选条目未回填完成 / 已被淘汰时取次优)。一次性批量 exists
+        全部候选 (结果按传入顺序与候选一一对应), 语义与原先"逐候选
+        exists、首个命中即返回"一致 —— 只是对首个命中之后的候选也
+        发了查询 (只读, 无副作用, 换来一次网络往返覆盖全部候选)。
+        """
+        if not over_threshold:
+            return None
+        ordered = sorted(over_threshold, key=lambda s: -s[0])
+        exists_res = self._backend.exists([c for _, c in ordered])
+        if not exists_res:
+            return None  # 防御: SDK 异常时按无候选处理
+        for (score, candidate_mm_hash), existed in zip(ordered, exists_res):
+            if existed == 1:
                 return score, candidate_mm_hash
         return None
 
@@ -722,8 +786,8 @@ class ECMemcacheConnector(ECConnectorBase):
         也防止同图重复起线程); memcache 写入是网络操作, offload 到
         daemon 线程异步执行, 不阻塞调度主流程。插入时 embedding 可能
         尚未写入 memcache (ViT 未执行), 写入线程也可能尚未完成, 后续
-        查询有 exists / _resized_get 读回确认兜底, 指向未写入/已淘汰
-        条目的候选只会被跳过。
+        查询有 exists / _resized_get_multi 读回确认兜底, 指向未写入/
+        已淘汰条目的候选只会被跳过。
         """
         if current_image_mm_hash in self._mm_hash_to_resized_meta:
             return
@@ -741,7 +805,7 @@ class ECMemcacheConnector(ECConnectorBase):
         resized: torch.Tensor,
     ) -> None:
         """_ssim_register 的后台线程体: 拷贝 + memcache 写入。
-        异常只打日志不回传 —— 写入失败的候选后续 _resized_get
+        异常只打日志不回传 —— 写入失败的候选后续 _resized_get_multi
         读不到即自然跳过, 不影响主流程正确性。
         """
         try:
@@ -764,37 +828,71 @@ class ECMemcacheConnector(ECConnectorBase):
         if self._backend.exists([key]) == [1]:
             return
         t = tensor.contiguous()
-        # CPU 内存的 put 是同步拷贝, 无 _ec_put 的计算流/SDMA 队列同步
-        # 问题; 只需保证 t 存活到 put 返回
+        # CPU 内存的 put 是同步拷贝, 无 _ec_put_multi 的计算流/SDMA 队列
+        # 同步问题; 只需保证 t 存活到 put 返回
         self._backend.put([key], [[t.data_ptr()]], [[t.nbytes]], MmcDirect.COPY_H2G.value)
         logger.info("EC RESIZED PUT: key=%s nbytes=%d shape=%r",
                     key, t.nbytes, tuple(t.shape))
 
-    def _resized_get(self, mm_hash: str) -> torch.Tensor | None:
-        """按 mm_hash 从 memcache 读回 resized 张量 (CPU); 无本地元信息 /
-        条目缺失 / 尺寸不符 / 读失败时返回 None。"""
-        meta = self._mm_hash_to_resized_meta.get(mm_hash)
-        if meta is None:
-            return None
-        shape, dtype = meta
-        key = _RESIZED_KEY_PREFIX + mm_hash
-        key_infos = self._backend.batch_get_key_info([key])
-        if not key_infos or key_infos[0].size() == 0:
-            return None
-        nbytes = key_infos[0].size()
-        buf = torch.empty(shape, dtype=dtype)
-        if buf.nbytes != nbytes:
-            logger.warning(
-                "EC RESIZED GET size mismatch: key=%s meta=%r/%s nbytes=%d "
-                "store_nbytes=%d", key, shape, dtype, buf.nbytes, nbytes)
-            return None
-        res = self._backend.get([key], [[buf.data_ptr()]], [[nbytes]], MmcDirect.COPY_G2H.value)
-        if res is None or (res and res[0] != 0):
-            logger.warning("EC RESIZED GET failed: key=%s res=%s", key, res)
-            return None
-        # 目标是 CPU 内存, get 返回即拷贝完成, 无需 _ec_get 的
-        # torch.npu.synchronize (那是等 SDMA 直写 NPU buffer)
-        return buf
+    def _resized_get_multi(self, mm_hashes: list[str]) -> list[torch.Tensor | None]:
+        """按 mm_hashes 批量读回 resized 张量 (CPU), 结果与入参位置一一对应。
+
+        无本地元信息 / 条目缺失 (key_info.size()==0) / 尺寸不符 / 读失败
+        的 key 对应 None。按 _resized_get_chunk (EC_RESIZED_GET_CHUNK
+        环境变量, 默认 32) 分块批读: 控制 CPU 峰值内存与单次 SDK 调用
+        规模。目标是 CPU 内存, get 返回即拷贝完成, 无需 _ec_get_multi
+        的 torch.npu.synchronize (那是等 SDMA 直写 NPU buffer)。
+        """
+        if not mm_hashes:
+            return []
+        results: list[torch.Tensor | None] = [None] * len(mm_hashes)
+        for start in range(0, len(mm_hashes), self._resized_get_chunk):
+            chunk = mm_hashes[start:start + self._resized_get_chunk]
+            # 无本地元信息 (shape/dtype) 的 key 无法分配读回 buffer, 直接跳过
+            alive = [(i, h) for i, h in enumerate(chunk)
+                     if h in self._mm_hash_to_resized_meta]
+            if not alive:
+                continue
+            keys = [_RESIZED_KEY_PREFIX + h for _, h in alive]
+            key_infos = self._backend.batch_get_key_info(keys)
+            if not key_infos:
+                # 整批查询失败 (SDK 返回空), 保守按全缺失处理
+                logger.warning("EC RESIZED BATCH-GET key_info failed: keys=%s", keys)
+                continue
+            # 逐个 key 分配 buffer; 已淘汰 (size 0) / 尺寸不符的 key 不入批
+            get_keys: list[str] = []
+            get_addrs: list[list[int]] = []
+            get_sizes: list[list[int]] = []
+            # (chunk 内下标, get 批内下标, buf): get 结果按位写回 results 用
+            pending: list[tuple[int, int, torch.Tensor]] = []
+            for j, (i, mm_hash) in enumerate(alive):
+                ki = key_infos[j]
+                if ki.size() == 0:
+                    continue  # 条目未回填完成 / 已被淘汰
+                shape, dtype = self._mm_hash_to_resized_meta[mm_hash]
+                nbytes = ki.size()
+                buf = torch.empty(shape, dtype=dtype)
+                if buf.nbytes != nbytes:
+                    logger.warning(
+                        "EC RESIZED GET size mismatch: key=%s meta=%r/%s nbytes=%d "
+                        "store_nbytes=%d", keys[j], shape, dtype, buf.nbytes, nbytes)
+                    continue
+                pending.append((i, len(get_keys), buf))
+                get_keys.append(keys[j])
+                get_addrs.append([buf.data_ptr()])
+                get_sizes.append([nbytes])
+            if not pending:
+                continue
+            res = self._backend.get(get_keys, get_addrs, get_sizes,
+                                    MmcDirect.COPY_G2H.value)
+            for i, sdk_i, buf in pending:
+                if res is None or res[sdk_i] != 0:
+                    logger.warning("EC RESIZED GET failed: key=%s res=%s",
+                                   get_keys[sdk_i],
+                                   None if res is None else res[sdk_i])
+                    continue
+                results[start + i] = buf
+        return results
 
     def _register_phash(
         self,
@@ -922,18 +1020,38 @@ class ECMemcacheConnector(ECConnectorBase):
     def start_load_caches(
         self, encoder_cache: dict[str, torch.Tensor], **kwargs
     ) -> None:
-        """按 scheduler 下发的 loads 从 memcache 取 embedding, 注入 encoder_cache。"""
+        """按 scheduler 下发的 loads 从 memcache 批量取 embedding, 注入 encoder_cache。"""
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, ECMemcacheConnectorMetadata)
 
+        # 三段式批量:
+        #  ① 收集: 过滤已注入条目并去重 —— 同一 current 只取首次 (原逐条
+        #    路径里重复 current 在首次注入后即被 encoder_cache 命中跳过,
+        #    这里在收集期等价跳过); 同一取数键只取一次 (原路径对重复取数
+        #    键会重复拉取, 批量后去重一次拉取, 同一张量共享注入多个
+        #    current, 下游只读, 无副作用)
+        pending: list[tuple[str, str]] = []
+        seen_cur: set[str] = set()
         for current_image_mm_hash, hit_image_mm_hash in metadata.loads:
-            if current_image_mm_hash in encoder_cache:
+            if (current_image_mm_hash in encoder_cache
+                    or current_image_mm_hash in seen_cur):
                 continue
+            seen_cur.add(current_image_mm_hash)
+            pending.append((current_image_mm_hash, hit_image_mm_hash))
+        if not pending:
+            return
+        unique_hits = list(dict.fromkeys(h for _, h in pending))
+        embeddings = self._ec_get_multi(unique_hits)
+        hit_to_embedding = dict(zip(unique_hits, embeddings))
+
+        #  ② 注入: 注入键永远是 mm_hash; 同时登记回填请求
+        backfills: list[tuple[str, torch.Tensor]] = []
+        for current_image_mm_hash, hit_image_mm_hash in pending:
             # 取数键是 tuple 第 2 元素: L1 命中时即 mm_hash 本身;
             # L2 模糊命中时为候选图的 identifier (本请求 mm_hash 下
             # 无数据 —— 本图是命中条目, ViT 被跳过, 从未被写过,
             # 按 mm_hash 取必然取空)
-            embedding = self._ec_get(hit_image_mm_hash)
+            embedding = hit_to_embedding[hit_image_mm_hash]
             if embedding is None:
                 # 调度时存在但读取时已被淘汰: 该条目将被当 miss 处理,
                 # 由 encoder_cache 缺失触发后续重算 (取决于上游容错)
@@ -943,22 +1061,28 @@ class ECMemcacheConnector(ECConnectorBase):
                     hit_image_mm_hash,
                 )
                 continue
-            # 注入键永远是 mm_hash
             encoder_cache[current_image_mm_hash] = embedding
             # L2 模糊命中 (取数键 ≠ 注入键): 把候选图的 embedding 以本图
             # mm_hash 回填 memcache —— 本图后续请求直接 L1 命中, 无需再
             # 走模糊匹配; scheduler 已把本图 pHash 登记进索引, 本图也可
             # 辐射后续相似图。注意语义: 此后本图的精确 L1 命中取到的也是
             # 候选图的近似 embedding (与本图首次命中时一致, 幂等)。
-            # 写仅 rank 0 执行 (同 save_caches); _ec_put 内 exists 去重。
+            # 写仅 rank 0 执行 (同 save_caches); _ec_put_multi 内 exists 去重。
             if hit_image_mm_hash != current_image_mm_hash and self._save_rank:
-                self._ec_put(current_image_mm_hash, embedding)
+                backfills.append((current_image_mm_hash, embedding))
             logger.info(
                 "EC LOAD: hit_image_mm_hash=%s → current_image_mm_hash=%s embedding shape=%r",
                 hit_image_mm_hash,
                 current_image_mm_hash,
                 embedding.shape,
             )
+
+        #  ③ 回填: 一次性批量回填 (exists 去重 + 单次同步 + 单次 put)。
+        #    回填 key 与取数 key 无重叠: 回填只发生在 hit ≠ current 的
+        #    条目上, 而这类 current 从未作为 hit 被读过 (L1 命中条目的
+        #    key 都已存在, exists 去重会跳过), 顺序无耦合。日志顺序由
+        #    原来的"逐条 LOAD/PUT 交错"变为"全部 LOAD 后 PUT", 仅观感变化。
+        self._ec_put_multi(backfills)
 
     def save_caches(
         self, encoder_cache: dict[str, torch.Tensor], mm_hash: str, **kwargs
@@ -969,36 +1093,97 @@ class ECMemcacheConnector(ECConnectorBase):
             return
         if mm_hash not in encoder_cache:
             return
-        self._ec_put(mm_hash, encoder_cache[mm_hash])
+        # 上游逐 mm_hash 调用一次, 每次仅一个键; 传单元素列表, 行为与
+        # 原单 key put 一致 (一次 exists 去重 + 一次 put)
+        self._ec_put_multi([(mm_hash, encoder_cache[mm_hash])])
 
     # ==============================
     # Worker-side memcache helpers
     # ==============================
 
-    def _ec_get(self, key: str) -> torch.Tensor | None:
-        """按 key 从 memcache 读回 embedding (NPU 张量)。"""
-        key_infos = self._backend.batch_get_key_info([key])
-        if not key_infos or key_infos[0].size() == 0:
-            return None
-        nbytes = key_infos[0].size()
-        num_tokens = nbytes // self._elem_size // self._hidden_dim
-        buf = torch.empty(num_tokens, self._hidden_dim, dtype=self._dtype, device="npu")
-        res = self._backend.get([key], [[buf.data_ptr()]], [[nbytes]])
-        if res is None or (res and res[0] != 0):
-            logger.warning("EC memcache get failed: key=%s res=%s", key, res)
-            return None
+    def _ec_get_multi(self, keys: list[str]) -> list[torch.Tensor | None]:
+        """按 keys 批量读回 embedding (NPU 张量), 结果与入参位置一一对应。
+
+        条目缺失 (key_info.size()==0) / 读失败的 key 对应 None。批量 get
+        返回后统一同步一次计算流, 等价于原单 key 路径的"注入前同步一次"
+        (SDMA 直写 buf 与计算流读分属不同硬件队列, 见下方注释)。
+        """
+        if not keys:
+            return []
+        key_infos = self._backend.batch_get_key_info(keys)
+        if not key_infos:
+            # 整批查询失败 (SDK 返回空), 保守按全缺失处理
+            logger.warning("EC memcache batch_get_key_info failed: keys=%s", keys)
+            return [None] * len(keys)
+        # 逐个 key 分配 NPU buffer (尺寸由 key_info 给出); 已淘汰 (size 0) 的
+        # key 不入批, 结果记为 None
+        alive_idx: list[int] = []  # keys 内下标
+        get_keys: list[str] = []
+        get_addrs: list[list[int]] = []
+        get_sizes: list[list[int]] = []
+        bufs: list[torch.Tensor] = []
+        for i, (key, ki) in enumerate(zip(keys, key_infos)):
+            if ki.size() == 0:
+                continue
+            nbytes = ki.size()
+            num_tokens = nbytes // self._elem_size // self._hidden_dim
+            buf = torch.empty(num_tokens, self._hidden_dim,
+                              dtype=self._dtype, device="npu")
+            alive_idx.append(i)
+            get_keys.append(key)
+            get_addrs.append([buf.data_ptr()])
+            get_sizes.append([nbytes])
+            bufs.append(buf)
+        if not get_keys:
+            return [None] * len(keys)
+        res = self._backend.get(get_keys, get_addrs, get_sizes)
+        # 批量生效观测: 一次 get 覆盖本步全部待取条目 (改造前为逐条单 key
+        # 查询), 日志里 keys 数即批量规模
+        logger.info("EC BATCH GET: keys=%d", len(get_keys))
+        embeddings: list[torch.Tensor | None] = [None] * len(keys)
+        for sdk_i, i in enumerate(alive_idx):
+            if res is None or res[sdk_i] != 0:
+                logger.warning("EC memcache get failed: key=%s res=%s",
+                               get_keys[sdk_i],
+                               None if res is None else res[sdk_i])
+                continue
+            embeddings[i] = bufs[sdk_i]
+            logger.info("EC memcache get success: key=%s buf shape=%r",
+                        get_keys[sdk_i], bufs[sdk_i].shape)
         # get 是 SDMA 引擎直写 buf, 与后续 forward 读 buf 的计算流分属
         # 不同硬件队列; 注入 encoder_cache 前同步一次, 保证计算流读到
         # 完整的拷贝结果, 否则模型拿到的是未写完的 buffer (垃圾输出)。
+        # 单 key 路径逐次同步, 批量路径整批同步一次。
         torch.npu.synchronize()
-        logger.info("EC memcache get success: key=%s buf shape=%r", key, buf.shape)
-        return buf
+        return embeddings
 
-    def _ec_put(self, key: str, tensor: torch.Tensor) -> None:
-        """按 key 把 embedding 写入 memcache; 已存在则跳过 (TP/重试去重)。"""
-        if self._backend.exists([key]) == [1]:
+    def _ec_put_multi(self, items: list[tuple[str, torch.Tensor]]) -> None:
+        """按 (key, tensor) 列表批量写 embedding; exists 去重后单次批量 put。
+
+        语义与原单 key 路径逐条一致 (TP/重试去重): 已存在的 key 跳过, 剩余
+        key 在一次 put 内完成。写前同步一次计算流 (SDMA 直读 vs 计算流
+        异步写出的硬件队列分属问题见下方注释), 整批分摊一次同步。
+        put 的逐 key 失败结果忽略, 由 backend 内部日志上报 (与单 key
+        路径一致)。
+        """
+        if not items:
             return
-        t = tensor.contiguous()
+        keys = [key for key, _ in items]
+        exists_res = self._backend.exists(keys)
+        if not exists_res:
+            # 防御: SDK 异常返回空时按全部不存在处理 (与原单 key 路径把
+            # exists != 1 当不存在、继续 put 的语义一致)
+            exists_res = [0] * len(keys)
+        to_put: list[tuple[str, torch.Tensor]] = []
+        for (key, tensor), existed in zip(items, exists_res):
+            if existed == 1:
+                continue  # 已存在 (TP/重试去重)
+            t = tensor.contiguous()
+            # contiguous() 临时张量必须存活到 put 返回 (SDMA 直读), 持有在
+            # to_put 里
+            to_put.append((key, t))
+        if not to_put:
+            return
         # tensor 由 ViT/merger kernel 在计算流上异步写出, 而 put 是
         # SDMA 引擎直读 NPU 显存, 两者分属不同硬件队列、API 内部不与
         # torch 流同步 (对照 kv_pool pool_worker 先 record event 再
@@ -1007,8 +1192,16 @@ class ECMemcacheConnector(ECConnectorBase):
         # 拿到损坏的 embedding。同时保证同步返回前 t 一直存活, 避免
         # contiguous() 临时张量被释放后底层显存被复用。
         torch.npu.current_stream().synchronize()
-        self._backend.put([key], [[t.data_ptr()]], [[t.nbytes]])
-        logger.info("EC PUT: key=%s nbytes=%d", key, t.nbytes)
+        # 批量生效观测: 一次 put 覆盖全部待写条目 (改造前为逐条单 key
+        # 查询), 日志里 keys 数即批量规模
+        logger.info("EC BATCH PUT: keys=%d", len(to_put))
+        self._backend.put(
+            [key for key, _ in to_put],
+            [[t.data_ptr()] for _, t in to_put],
+            [[t.nbytes] for _, t in to_put],
+        )
+        for key, t in to_put:
+            logger.info("EC PUT: key=%s nbytes=%d", key, t.nbytes)
 
 
 def _get_encoder_cache_hidden_dim(vllm_config: "VllmConfig") -> int:
