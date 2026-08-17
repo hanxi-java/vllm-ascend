@@ -171,7 +171,7 @@ class MemcacheBackend(Backend):
             return [0] * len(keys)
         return finish(keys, results)
 
-    def get(self, key: list[str], addr: list[list[int]], size: list[list[int]]):
+    def get(self, key: list[str], addr: list[list[int]], size: list[list[int]], direction=MmcDirect.COPY_G2L.value,):
         if self._lazy_init and not self._store_initialized:
             logger.error(
                 "Failed to get %d keys out of %d. Store is not initialized; "
@@ -183,7 +183,7 @@ class MemcacheBackend(Backend):
             return
         assert self.store is not None
         try:
-            res = self.store.batch_get_into_layers(key, addr, size, MmcDirect.COPY_G2L.value)
+            res = self.store.batch_get_into_layers(key, addr, size, direction)
             failed_codes = [int(value) for value in res if value != 0]
             failed_count = len(failed_codes)
             if failed_count:
@@ -207,11 +207,11 @@ class MemcacheBackend(Backend):
             logger.debug("Failed to get key details. keys=%s", key)
             return None
 
-    def put(self, key: list[str], addr: list[list[int]], size: list[list[int]]):
+    def put(self, key: list[str], addr: list[list[int]], size: list[list[int]], direction=MmcDirect.COPY_L2G.value,):
         self.ensure_initialized()
         assert self.store is not None
         try:
-            res = self.store.batch_put_from_layers(key, addr, size, MmcDirect.COPY_L2G.value)
+            res = self.store.batch_put_from_layers(key, addr, size, direction)
             failed_codes = [int(value) for value in res if value != 0]
             failed_count = len(failed_codes)
             if failed_count:
