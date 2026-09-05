@@ -21,16 +21,19 @@ import torch
 import torch.nn.functional as F
 import torch_npu
 from vllm.config import get_current_vllm_config
+from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, use_cann_megamoe
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights, build_fused_experts_input
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
-from vllm_ascend.ops.fused_moe.moe_utils import cumsum_group_list, maybe_normalize_mxfp_scale_layout
+from vllm_ascend.ops.fused_moe.moe_utils import (
+    cumsum_group_list,
+    maybe_normalize_mxfp_scale_layout,
+)
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts  # noqa: F401
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, dispose_tensor, is_950
-
 from ..base import (
     AscendLinearScheme,
     AscendMoEScheme,
@@ -120,7 +123,6 @@ class AscendW4A4MXFP4DynamicLinearMethod(AscendLinearScheme):
         - weight: (output_size, input_size) -> (input_size, output_size)
         - weight_scale: (n_dim, k_dim) -> (k_dim//2, n_dim, 2)
         """
-
         n_dim, k_dim = layer.weight_scale.data.shape
         # Shape should be padded if it cannot be divided by 2
         if k_dim % 2 != 0:
@@ -211,6 +213,7 @@ class AscendW4A4MXFP4DynamicFusedMoEMethod(AscendMoEScheme):
         )
 
     def get_fused_mc2_weights(self, layer: torch.nn.Module) -> MoEWeights:
+        # logger.info("w4a4 get_fused_mc2_weights: %r", _EXTRA_CTX.use_mega_moe)
         if _EXTRA_CTX.use_mega_moe:
             # MegaMoe consumes the non-transposed per-expert weight/scale lists
             # built in process_weights_after_loading (the non-mega path uses the
@@ -218,12 +221,17 @@ class AscendW4A4MXFP4DynamicFusedMoEMethod(AscendMoEScheme):
             return MoEWeights(
                 w1=layer.cann_mega_moe_w13_weight_list,
                 w2=layer.cann_mega_moe_w2_weight_list,
-                w1_scale=layer.cann_mega_moe_fused_w1_scale_list,
-                w2_scale=layer.cann_mega_moe_fused_w2_scale_list,
+                w1_scale=layer.cann_mega_moe_w13_weight_scale_list,
+                w2_scale=layer.cann_mega_moe_w2_weight_scale_list,
                 w1_scale_bias=None,
                 w2_scale_bias=None,
+                shared_w1=getattr(layer, "cann_mega_moe_shared_w13_weight_list", None),
+                shared_w2=getattr(layer, "cann_mega_moe_shared_w2_weight_list", None),
+                shared_w1_scale=getattr(layer, "cann_mega_moe_shared_w13_weight_scale_list", None),
+                shared_w2_scale=getattr(layer, "cann_mega_moe_shared_w2_weight_scale_list", None),
             )
         else:
+            # logger.info("w4a4 get_fused_mc2_weights not use_mega_moe")
             return MoEWeights(
                 w1=layer.w13_weight,
                 w2=layer.w2_weight,
@@ -253,6 +261,7 @@ class AscendW4A4MXFP4DynamicFusedMoEMethod(AscendMoEScheme):
         # E8M0 scales. Capture per-expert lists before the non-mega path
         # transposes everything below.
         if use_cann_megamoe(get_current_vllm_config()) and is_950():
+            # logger.info("w4a4 process_weights_after_loading use_mega_moe:%r, is 950:%r", use_cann_megamoe(get_current_vllm_config()), is_950())
             # MegaMoe (FUSED_MC2) on A5 uses the packed FP4 weight format directly
             layer.cann_mega_moe_w13_weight_list = [
                 torch_npu.npu_format_cast(weight.clone(), ACL_FORMAT_FRACTAL_NZ) for weight in layer.w13_weight.data
@@ -273,6 +282,30 @@ class AscendW4A4MXFP4DynamicFusedMoEMethod(AscendMoEScheme):
             layer.cann_mega_moe_w2_weight_scale_list = [
                 w2_weight_scale.clone() for w2_weight_scale in layer.w2_weight_scale.data.unbind(dim=0)
             ]
+
+            # Shared experts (A5 only): reformat the captured raw weights into
+            # the same per-expert FRACTAL_NZ layout as the routed experts above.
+            if is_950() and getattr(layer, "ascend_shared_experts_layer", None) is not None:
+                layer.cann_mega_moe_shared_w13_weight_list = [
+                    torch_npu.npu_format_cast(shared_w13_weight.clone(), ACL_FORMAT_FRACTAL_NZ) for shared_w13_weight in layer.ascend_shared_expert_role.gate_up_proj.weight.data
+                ]
+                layer.cann_mega_moe_shared_w2_weight_list = [
+                    torch_npu.npu_format_cast(
+                        shared_w2_weight.clone(),
+                        ACL_FORMAT_FRACTAL_NZ,
+                        customize_dtype=torch.float8_e4m3fn,
+                        input_dtype=torch_npu.float4_e2m1fn_x2,
+                    )
+                    for shared_w2_weight in layer.ascend_shared_expert_role.down_proj.weight.data
+                ]
+                layer.cann_mega_moe_shared_w13_weight_scale_list = [
+                    w13_weight_scale.clone() for w13_weight_scale in layer.gate_up_proj.weight_scale.data.unbind(dim=0)
+                ]
+                layer.cann_mega_moe_shared_w2_weight_scale_list = [
+                    w2_weight_scale.clone() for w2_weight_scale in layer.down_proj.weight_scale.data.unbind(dim=0)
+                ]
+                delattr(layer, "ascend_shared_experts_layer")
+
             tensor_names = (
                 "w13_weight",
                 "w2_weight",

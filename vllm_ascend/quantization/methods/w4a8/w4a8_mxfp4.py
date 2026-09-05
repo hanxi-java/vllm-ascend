@@ -25,12 +25,15 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.device.device_config import is_950
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights, build_fused_experts_input
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
-from vllm_ascend.ops.fused_moe.moe_utils import cumsum_group_list, maybe_normalize_mxfp_scale_layout
+from vllm_ascend.ops.fused_moe.moe_utils import (
+    cumsum_group_list,
+    maybe_normalize_mxfp_scale_layout,
+)
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts  # noqa: F401
-from vllm_ascend.utils import FP8_METHOD, dispose_tensor
-
+from vllm_ascend.utils import FP8_METHOD, dispose_tensor, ACL_FORMAT_FRACTAL_NZ
 from ..base import (
     AscendLinearScheme,
     AscendMoEScheme,
@@ -200,6 +203,10 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
                 w2_scale=layer.w2_weight_scale.data,
                 w1_scale_bias=None,
                 w2_scale_bias=None,
+                shared_w1=getattr(layer, "cann_mega_moe_shared_w13_weight_list", None),
+                shared_w2=getattr(layer, "cann_mega_moe_shared_w2_weight_list", None),
+                shared_w1_scale=getattr(layer, "cann_mega_moe_shared_w13_weight_scale_list", None),
+                shared_w2_scale=getattr(layer, "cann_mega_moe_shared_w2_weight_scale_list", None),
             )
         else:
             return MoEWeights(
@@ -213,10 +220,10 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
 
     def process_weights_after_loading(self, layer):
         layer.w13_weight.data = torch_npu.npu_format_cast(
-            layer.w13_weight.data, 29, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2
+            layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2
         )
         layer.w2_weight.data = torch_npu.npu_format_cast(
-            layer.w2_weight.data, 29, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2
+            layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2
         )
         layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2)
         layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2)
@@ -224,6 +231,26 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
         layer.w13_weight_scale.data = layer.w13_weight_scale.data.reshape(g, n, k // 2, 2).transpose(-3, -2)
         g, n, k = layer.w2_weight_scale.shape
         layer.w2_weight_scale.data = layer.w2_weight_scale.data.reshape(g, n, k // 2, 2).transpose(-3, -2)
+
+        if is_950() and getattr(layer, "ascend_shared_experts_layer", None) is not None:
+            layer.cann_mega_moe_shared_w13_weight_list = [
+                torch_npu.npu_format_cast(shared_w13_weight.clone(), ACL_FORMAT_FRACTAL_NZ, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2)
+                for shared_w13_weight in layer.ascend_shared_expert_role.gate_up_proj.weight.data
+            ]
+            layer.cann_mega_moe_shared_w2_weight_list = [
+                torch_npu.npu_format_cast(
+                    shared_w2_weight.clone(),
+                    ACL_FORMAT_FRACTAL_NZ, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2
+                )
+                for shared_w2_weight in layer.ascend_shared_expert_role.down_proj.weight.data
+            ]
+            layer.cann_mega_moe_shared_w13_weight_scale_list = [
+                w13_weight_scale.clone() for w13_weight_scale in layer.gate_up_proj.weight_scale.data.unbind(dim=0)
+            ]
+            layer.cann_mega_moe_shared_w2_weight_scale_list = [
+                w2_weight_scale.clone() for w2_weight_scale in layer.down_proj.weight_scale.data.unbind(dim=0)
+            ]
+            delattr(layer, "ascend_shared_experts_layer")
 
     def apply_gmm1_act_quant(self, mlp_compute_input: MoEMlpComputeInput):
         hidden_states = mlp_compute_input.hidden_states

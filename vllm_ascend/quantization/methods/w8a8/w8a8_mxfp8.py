@@ -26,13 +26,16 @@ from vllm.utils.math_utils import cdiv
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, use_cann_megamoe
+from vllm_ascend.device.device_config import is_950
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights, build_fused_experts_input
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
-from vllm_ascend.ops.fused_moe.moe_utils import cumsum_group_list, maybe_normalize_mxfp_scale_layout
+from vllm_ascend.ops.fused_moe.moe_utils import (
+    cumsum_group_list,
+    maybe_normalize_mxfp_scale_layout,
+)
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts  # noqa: F401
 from vllm_ascend.quantization.utils import get_dynamic_mx_quant_scale_alg
 from vllm_ascend.utils import FP8_METHOD, dispose_tensor
-
 from ..base import (
     AscendLinearScheme,
     AscendMoEScheme,
@@ -144,6 +147,15 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
         # Check if already transformed to avoid double transformation
         if getattr(layer, "_mxfp8_transformed", False):
             return
+
+        # Capture the original (pre-transpose) shared-expert weights for the A5
+        # mega_moe shared-expert fusion path. The shared-expert linear layers
+        # are transformed in-place below, so snapshot them before that happens.
+        if getattr(layer, "_ascend_shared_expert_role", None) is not None and use_cann_megamoe(
+            get_current_vllm_config()
+        ):
+            layer._ascend_shared_raw_weight = layer.weight.data.clone()
+            layer._ascend_shared_raw_weight_scale = layer.weight_scale.data.clone()
 
         # Store original shapes for RL weight reloading
         # Only store on first call (when shapes are in original format)
@@ -314,10 +326,14 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
             return MoEWeights(
                 w1=layer.cann_mega_moe_w13_weight_list,
                 w2=layer.cann_mega_moe_w2_weight_list,
-                w1_scale=layer.cann_mega_moe_fused_w1_scale_list,
-                w2_scale=layer.cann_mega_moe_fused_w2_scale_list,
+                w1_scale=layer.cann_mega_moe_w13_weight_scale_list,
+                w2_scale=layer.cann_mega_moe_w2_weight_scale_list,
                 w1_scale_bias=None,
                 w2_scale_bias=None,
+                shared_w1=getattr(layer, "cann_mega_moe_shared_w13_weight_list", None),
+                shared_w2=getattr(layer, "cann_mega_moe_shared_w2_weight_list", None),
+                shared_w1_scale=getattr(layer, "cann_mega_moe_shared_w13_weight_scale_list", None),
+                shared_w2_scale=getattr(layer, "cann_mega_moe_shared_w2_weight_scale_list", None),
             )
         else:
             return MoEWeights(
@@ -386,6 +402,20 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
             layer.cann_mega_moe_w2_weight_scale_list = [
                 w2_weight_scale.clone() for w2_weight_scale in layer.w2_weight_scale.data.unbind(dim=0)
             ]
+            if is_950() and getattr(layer, "ascend_shared_experts_layer", None) is not None:
+                layer.cann_mega_moe_shared_w13_weight_list = [
+                    shared_w13_weight.clone() for shared_w13_weight in layer.ascend_shared_expert_role.gate_up_proj.weight.data
+                ]
+                layer.cann_mega_moe_shared_w2_weight_list = [
+                    shared_w2_weight.clone() for shared_w2_weight in layer.ascend_shared_expert_role.down_proj.weight.data
+                ]
+                layer.cann_mega_moe_shared_w13_weight_scale_list = [
+                    w13_weight_scale.clone() for w13_weight_scale in layer.gate_up_proj.weight_scale.data.unbind(dim=0)
+                ]
+                layer.cann_mega_moe_shared_w2_weight_scale_list = [
+                    w2_weight_scale.clone() for w2_weight_scale in layer.down_proj.weight_scale.data.unbind(dim=0)
+                ]
+                delattr(layer, "ascend_shared_experts_layer")
 
             tensor_names = (
                 "w13_weight",

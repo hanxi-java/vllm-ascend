@@ -94,6 +94,16 @@ class AscendSharedExperts:
         self.multistream_overlap = ascend_config.multistream_overlap_shared_expert
         self.weights_replicated = ascend_config.enable_shared_expert_dp
 
+        # Mark the shared-expert linear projections so the quant method can
+        # capture their original (pre-transpose) weights for the A5 mega_moe
+        # shared-expert fusion path. The capture itself is gated on
+        # use_cann_megamoe()/is_950() inside the linear schemes, so marking here
+        # is harmless for the non-mega_moe and non-A5 paths.
+        if hasattr(self.layer, "gate_up_proj"):
+            self.layer.gate_up_proj._ascend_shared_expert_role = "w1"
+        if hasattr(self.layer, "down_proj"):
+            self.layer.down_proj._ascend_shared_expert_role = "w2"
+
         if self.multistream_overlap:
             # Wrap the quant_method's process_weights_after_loading to validate that
             # splitting shared expert computation (gate_up projection + activation,

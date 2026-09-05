@@ -19,6 +19,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 import torch
+import torch_npu
 from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
@@ -440,7 +441,20 @@ class FusedMC2CommImpl(MoECommMethod):
         # A8W4-INT precision-compensation biases B1/B2 (l1_bias/l2_bias).
         l1_bias = weights.w1_scale_bias
         l2_bias = weights.w2_scale_bias
-
+        # Shared experts are fused into mega_moe only on Ascend 950 (A5), where
+        # the MXFP quant methods pre-built the shared weight/scale lists. On A2/A3
+        # (or when the lists are absent) keep them None so the shared experts run
+        # on the separate stream instead.
+        shared_l1_weights = shared_l2_weights = None
+        shared_l1_weights_sf = shared_l2_weights_sf = None
+        if is_950() and weights.shared_w1 is not None:
+            shared_l1_weights = to_list(weights.shared_w1)
+            shared_l2_weights = to_list(weights.shared_w2)
+            shared_l1_weights_sf = weights.shared_w1_scale
+            shared_l2_weights_sf = weights.shared_w2_scale
+        logger.info(
+            "Before MegaMoe, fused_experts_input.hidden_states shape: %r, weight1 shape: %r, weight2 shape: %r, weight_type :%r, weight1:%s, weight2:%s",
+            fused_experts_input.hidden_states.shape, weight_type, weight1[0].shape, weight2[0].shape, torch_npu.get_npu_format(weight1[0]), torch_npu.get_npu_format(weight2[0]))
         out, expert_tokens = self.mega_moe(
             fused_experts_input.hidden_states,
             fused_experts_input.topk_ids.to(torch.int32),
@@ -456,6 +470,10 @@ class FusedMC2CommImpl(MoECommMethod):
             activation_clamp=activation_clamp,
             weight1_type=weight_type,
             weight2_type=weight_type,
+            shared_l1_weights=shared_l1_weights,
+            shared_l2_weights=shared_l2_weights,
+            shared_l1_weights_sf=shared_l1_weights_sf,
+            shared_l2_weights_sf=shared_l2_weights_sf,
         )
         # NOTE: self.expert_token_nums is only used by the
         # mega_moe path (enable_fused_mc2 == 1) as a

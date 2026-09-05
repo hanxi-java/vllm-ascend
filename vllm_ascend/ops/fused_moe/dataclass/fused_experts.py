@@ -42,6 +42,11 @@ class MoEWeights:
     w2_scale_bias: torch.Tensor | list[torch.Tensor] | None = None
     w1_offset: torch.Tensor | None = None
     w2_offset: torch.Tensor | None = None
+    # Shared-expert weights consumed by the A5 (Ascend 950) mega_moe op.
+    shared_w1: torch.Tensor | list[torch.Tensor] | None = None
+    shared_w2: torch.Tensor | list[torch.Tensor] | None = None
+    shared_w1_scale: torch.Tensor | list[torch.Tensor] | None = None
+    shared_w2_scale: torch.Tensor | list[torch.Tensor] | None = None
 
 
 @dataclass(frozen=True, slots=True)

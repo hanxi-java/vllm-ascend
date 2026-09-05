@@ -26,6 +26,7 @@ from vllm.model_executor.layers.fused_moe import FusedMoEConfig, FusedMoERouter
 from vllm.model_executor.layers.fused_moe.layer import MoERunner
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
+from vllm_ascend.device.device_config import is_950
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method, setup_moe_comm_method
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts
@@ -85,6 +86,9 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 self.quant_type,
                 self._quant_method,
             )
+            # Expose the shared-expert module to the routed-experts quant method
+            # so it can build the A5 mega_moe shared-expert weight lists.
+            self.routed_experts.ascend_shared_experts_layer = shared_experts
 
         setup_moe_comm_method(self.moe_config)
         alltoall_comm = get_moe_comm_method(MoECommType.ALLTOALL)
@@ -278,8 +282,11 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             input_ids: torch.Tensor | None = None,
         ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
             with self._sequence_parallel_context():
+                # mega_moe (FUSED_MC2 on A5) fuses the shared experts into the
+                # routed output, so skip the separate-stream shared-expert path;
+                # running it here would double-count the shared contribution.
                 shared_hidden_states = shared_experts_input if shared_experts_input is not None else hidden_states
-                if self.ascend_shared_experts is None:
+                if self.ascend_shared_experts is None or _EXTRA_CTX.use_mega_moe and is_950():
                     if self.is_internal_router:
                         gate = self.gate
                         assert gate is not None
