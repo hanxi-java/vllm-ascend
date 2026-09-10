@@ -295,11 +295,21 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                             hidden_states_fp32,
                             gate.weight_fp32 if hasattr(gate, "weight_fp32") else gate.weight.to(torch.float32),
                         )
-                    return self.routed_experts.forward_impl(
+                    # mega_moe already fuses the shared experts into routed_out,
+                    # so there is no separate shared output. The FusedMoEEvents the
+                    # routed experts attach for the separate-stream shared path is
+                    # not needed here, and leaking it through the compiled graph
+                    # breaks torch.compile ("Unable to cast FusedMoEEvents to
+                    # Tensor"). The moe_forward_shared op is declared to return two
+                    # tensors (shared_out, fused_out), so return a zero shared_out
+                    # to keep the return arity contract; the caller adds them,
+                    # yielding routed_out unchanged.
+                    routed_out, _ = self.routed_experts.forward_impl(
                         hidden_states=hidden_states,
                         router_logits=router_logits,
                         input_ids=input_ids,
                     )
+                    return torch.zeros_like(routed_out), routed_out
                 shared_expert_input, shared_input_all_gather_done = (
                     self.ascend_shared_experts.prepare_input_before_routed_experts(shared_hidden_states)
                 )

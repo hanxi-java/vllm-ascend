@@ -286,25 +286,58 @@ class AscendW4A4MXFP4DynamicFusedMoEMethod(AscendMoEScheme):
             # Shared experts (A5 only): reformat the captured raw weights into
             # the same per-expert FRACTAL_NZ layout as the routed experts above.
             if is_950() and getattr(layer, "ascend_shared_experts_layer", None) is not None:
-                layer.cann_mega_moe_shared_w13_weight_list = [
-                    torch_npu.npu_format_cast(shared_w13_weight.clone(), ACL_FORMAT_FRACTAL_NZ) for shared_w13_weight in layer.ascend_shared_expert_role.gate_up_proj.weight.data
-                ]
-                layer.cann_mega_moe_shared_w2_weight_list = [
-                    torch_npu.npu_format_cast(
-                        shared_w2_weight.clone(),
-                        ACL_FORMAT_FRACTAL_NZ,
-                        customize_dtype=torch.float8_e4m3fn,
-                        input_dtype=torch_npu.float4_e2m1fn_x2,
-                    )
-                    for shared_w2_weight in layer.ascend_shared_expert_role.down_proj.weight.data
-                ]
-                layer.cann_mega_moe_shared_w13_weight_scale_list = [
-                    w13_weight_scale.clone() for w13_weight_scale in layer.gate_up_proj.weight_scale.data.unbind(dim=0)
-                ]
-                layer.cann_mega_moe_shared_w2_weight_scale_list = [
-                    w2_weight_scale.clone() for w2_weight_scale in layer.down_proj.weight_scale.data.unbind(dim=0)
-                ]
-                delattr(layer, "ascend_shared_experts_layer")
+                shared_gate_up = layer.ascend_shared_experts_layer.gate_up_proj
+                # Shared experts form a single (non-stacked) expert: gate_up_proj /
+                # down_proj weights are 2-D (out, in), unlike the routed experts'
+                # 3-D (E, out, in) w13_weight/w2_weight. So format-cast the whole
+                # 2-D tensor once and wrap it in a single-element list instead of
+                # iterating over dim 0 (which would yield 1-D rows and fail the
+                # FRACTAL_NZ cast).
+                #
+                # The MTP draft block keeps its shared experts in BF16 (FLOAT in
+                # the quant description) while its routed experts are W4A4. Only
+                # fuse quantized (weight_scale-bearing) shared experts into
+                # mega_moe; leave BF16 ones absent so they run on the separate
+                # stream (see shared_l1_weights handling in moe_comm_method.py).
+                if hasattr(shared_gate_up, "weight_scale"):
+                    logger.info(
+                        "Before Cast shared expert, gate_up_proj shape: %r,  "
+                        "gate_up_proj weight_type :%r,"
+                        "down_proj shape: %r,  "
+                        "down_proj weight_type:%s, "
+                        "gate_up_proj.weight_scale shape:%r "
+                        "gate_up_proj.weight_scale weight_type:%r "
+                        "down_proj.weight_scale shape:%r "
+                        "down_proj.weight_scale weight_type:%r ",
+                        shared_gate_up.weight.shape,
+                        torch_npu.get_npu_format(shared_gate_up.weight),
+                        layer.ascend_shared_experts_layer.down_proj.weight.shape,
+                        torch_npu.get_npu_format(layer.ascend_shared_experts_layer.down_proj.weight),
+                        shared_gate_up.weight_scale.shape,
+                        torch_npu.get_npu_format(shared_gate_up.weight_scale),
+                        layer.ascend_shared_experts_layer.down_proj.weight_scale,
+                        torch_npu.get_npu_format(layer.ascend_shared_experts_layer.down_proj.weight_scale))
+                    layer.cann_mega_moe_shared_w13_weight_list = [
+                        torch_npu.npu_format_cast(
+                            shared_gate_up.weight.clone().transpose(0, 1).contiguous(),
+                            ACL_FORMAT_FRACTAL_NZ,
+                        )
+                    ]
+                    layer.cann_mega_moe_shared_w2_weight_list = [
+                        torch_npu.npu_format_cast(
+                            layer.ascend_shared_experts_layer.down_proj.weight.clone().transpose(0, 1).contiguous(),
+                            ACL_FORMAT_FRACTAL_NZ,
+                            customize_dtype=torch.float8_e4m3fn,
+                            input_dtype=torch_npu.float4_e2m1fn_x2,
+                        )
+                    ]
+                    layer.cann_mega_moe_shared_w13_weight_scale_list = [
+                        shared_gate_up.weight_scale.clone().transpose(0, 1).contiguous()
+                    ]
+                    layer.cann_mega_moe_shared_w2_weight_scale_list = [
+                        layer.ascend_shared_experts_layer.down_proj.weight_scale.clone().transpose(0, 1).contiguous()
+                    ]
+                    delattr(layer, "ascend_shared_experts_layer")
 
             tensor_names = (
                 "w13_weight",

@@ -403,19 +403,31 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
                 w2_weight_scale.clone() for w2_weight_scale in layer.w2_weight_scale.data.unbind(dim=0)
             ]
             if is_950() and getattr(layer, "ascend_shared_experts_layer", None) is not None:
-                layer.cann_mega_moe_shared_w13_weight_list = [
-                    shared_w13_weight.clone() for shared_w13_weight in layer.ascend_shared_expert_role.gate_up_proj.weight.data
-                ]
-                layer.cann_mega_moe_shared_w2_weight_list = [
-                    shared_w2_weight.clone() for shared_w2_weight in layer.ascend_shared_expert_role.down_proj.weight.data
-                ]
-                layer.cann_mega_moe_shared_w13_weight_scale_list = [
-                    w13_weight_scale.clone() for w13_weight_scale in layer.gate_up_proj.weight_scale.data.unbind(dim=0)
-                ]
-                layer.cann_mega_moe_shared_w2_weight_scale_list = [
-                    w2_weight_scale.clone() for w2_weight_scale in layer.down_proj.weight_scale.data.unbind(dim=0)
-                ]
-                delattr(layer, "ascend_shared_experts_layer")
+                shared_gate_up = layer.ascend_shared_experts_layer.gate_up_proj
+                # Shared experts form a single (non-stacked) expert: gate_up_proj /
+                # down_proj weights are 2-D (out, in), unlike the routed experts'
+                # 3-D (E, out, in) weights. Wrap the whole 2-D tensor in a
+                # single-element list instead of iterating dim 0 (which would yield
+                # 1-D rows).
+                #
+                # The MTP draft block keeps its shared experts in BF16 while its
+                # routed experts are quantized. Only fuse quantized shared experts
+                # into mega_moe; leave BF16 ones absent so they run on the separate
+                # stream.
+                if hasattr(shared_gate_up, "weight_scale"):
+                    layer.cann_mega_moe_shared_w13_weight_list = [
+                        shared_gate_up.weight.clone().transpose(0, 1).contiguous()
+                    ]
+                    layer.cann_mega_moe_shared_w2_weight_list = [
+                        layer.ascend_shared_experts_layer.down_proj.weight.clone().transpose(0, 1).contiguous()
+                    ]
+                    layer.cann_mega_moe_shared_w13_weight_scale_list = [
+                        shared_gate_up.weight_scale.clone().transpose(0, 1).contiguous()
+                    ]
+                    layer.cann_mega_moe_shared_w2_weight_scale_list = [
+                        layer.ascend_shared_experts_layer.down_proj.weight_scale.clone().transpose(0, 1).contiguous()
+                    ]
+                    delattr(layer, "ascend_shared_experts_layer")
 
             tensor_names = (
                 "w13_weight",

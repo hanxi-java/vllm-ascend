@@ -233,24 +233,41 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
         layer.w2_weight_scale.data = layer.w2_weight_scale.data.reshape(g, n, k // 2, 2).transpose(-3, -2)
 
         if is_950() and getattr(layer, "ascend_shared_experts_layer", None) is not None:
-            layer.cann_mega_moe_shared_w13_weight_list = [
-                torch_npu.npu_format_cast(shared_w13_weight.clone(), ACL_FORMAT_FRACTAL_NZ, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2)
-                for shared_w13_weight in layer.ascend_shared_expert_role.gate_up_proj.weight.data
-            ]
-            layer.cann_mega_moe_shared_w2_weight_list = [
-                torch_npu.npu_format_cast(
-                    shared_w2_weight.clone(),
-                    ACL_FORMAT_FRACTAL_NZ, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2
-                )
-                for shared_w2_weight in layer.ascend_shared_expert_role.down_proj.weight.data
-            ]
-            layer.cann_mega_moe_shared_w13_weight_scale_list = [
-                w13_weight_scale.clone() for w13_weight_scale in layer.gate_up_proj.weight_scale.data.unbind(dim=0)
-            ]
-            layer.cann_mega_moe_shared_w2_weight_scale_list = [
-                w2_weight_scale.clone() for w2_weight_scale in layer.down_proj.weight_scale.data.unbind(dim=0)
-            ]
-            delattr(layer, "ascend_shared_experts_layer")
+            shared_gate_up = layer.ascend_shared_experts_layer.gate_up_proj
+            # Shared experts form a single (non-stacked) expert: gate_up_proj /
+            # down_proj weights are 2-D (out, in), unlike the routed experts'
+            # 3-D (E, out, in) weights. Format-cast the whole 2-D tensor once and
+            # wrap it in a single-element list instead of iterating dim 0 (which
+            # yields 1-D rows and fails the FRACTAL_NZ cast).
+            #
+            # The MTP draft block keeps its shared experts in BF16 while its
+            # routed experts are quantized. Only fuse quantized shared experts
+            # into mega_moe; leave BF16 ones absent so they run on the separate
+            # stream.
+            if hasattr(shared_gate_up, "weight_scale"):
+                layer.cann_mega_moe_shared_w13_weight_list = [
+                    torch_npu.npu_format_cast(
+                        shared_gate_up.weight.clone().transpose(0, 1).contiguous(),
+                        ACL_FORMAT_FRACTAL_NZ,
+                        customize_dtype=torch.float8_e4m3fn,
+                        input_dtype=torch_npu.float4_e2m1fn_x2,
+                    )
+                ]
+                layer.cann_mega_moe_shared_w2_weight_list = [
+                    torch_npu.npu_format_cast(
+                        layer.ascend_shared_experts_layer.down_proj.weight.clone().transpose(0, 1).contiguous(),
+                        ACL_FORMAT_FRACTAL_NZ,
+                        customize_dtype=torch.float8_e4m3fn,
+                        input_dtype=torch_npu.float4_e2m1fn_x2,
+                    )
+                ]
+                layer.cann_mega_moe_shared_w13_weight_scale_list = [
+                    shared_gate_up.weight_scale.clone().transpose(0, 1).contiguous()
+                ]
+                layer.cann_mega_moe_shared_w2_weight_scale_list = [
+                    layer.ascend_shared_experts_layer.down_proj.weight_scale.clone().transpose(0, 1).contiguous()
+                ]
+                delattr(layer, "ascend_shared_experts_layer")
 
     def apply_gmm1_act_quant(self, mlp_compute_input: MoEMlpComputeInput):
         hidden_states = mlp_compute_input.hidden_states

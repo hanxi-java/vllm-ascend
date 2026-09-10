@@ -453,8 +453,16 @@ class FusedMC2CommImpl(MoECommMethod):
             shared_l1_weights_sf = weights.shared_w1_scale
             shared_l2_weights_sf = weights.shared_w2_scale
         logger.info(
-            "Before MegaMoe, fused_experts_input.hidden_states shape: %r, weight1 shape: %r, weight2 shape: %r, weight_type :%r, weight1:%s, weight2:%s",
-            fused_experts_input.hidden_states.shape, weight_type, weight1[0].shape, weight2[0].shape, torch_npu.get_npu_format(weight1[0]), torch_npu.get_npu_format(weight2[0]))
+            "Before MegaMoe, fused_experts_input.hidden_states shape: %r, weight_type: %r, "
+            "weight1 shape: %r, weight2 shape: %r, weight1 data format:%s, weight2 data format:%s, "
+            "shared_w1 shape: %r, shared_w1 data format:%s, shared_w2 shape: %r, shared_w2 data format:%s, shared_w1_sf shape: %r, shared_w2_sf shape: %r",
+            fused_experts_input.hidden_states.shape, weight_type, weight1[0].shape, weight2[0].shape, torch_npu.get_npu_format(weight1[0]), torch_npu.get_npu_format(weight2[0]),
+            shared_l1_weights[0].shape if shared_l1_weights is not None else None,
+            torch_npu.get_npu_format(shared_l1_weights[0]) if shared_l1_weights is not None else None,
+            shared_l2_weights[0].shape if shared_l2_weights is not None else None,
+            torch_npu.get_npu_format(shared_l2_weights[0]) if shared_l2_weights is not None else None,
+            shared_l1_weights_sf[0].shape if shared_l1_weights_sf is not None else None,
+            shared_l2_weights_sf[0].shape if shared_l2_weights_sf is not None else None)
         out, expert_tokens = self.mega_moe(
             fused_experts_input.hidden_states,
             fused_experts_input.topk_ids.to(torch.int32),
