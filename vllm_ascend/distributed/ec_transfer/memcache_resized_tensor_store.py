@@ -4,8 +4,9 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any
 from urllib.parse import quote
 
@@ -13,12 +14,12 @@ import torch
 from vllm.logger import logger
 
 from vllm_ascend.distributed.ec_transfer.similarity_cache_config import (
+    _MAX_SIMILARITY_COMPUTE_WORKERS,
+    _PARALLEL_SIMILARITY_COMPUTE_THRESHOLD,
     DEFAULT_RESIZED_IMAGE_RECV_BUFFER_SIZE,
     MAX_RESIZED_IMAGE_RECV_BUFFER_SIZE,
     MAX_RESIZED_IMAGE_TRANSFER_SIZE,
     MIN_RESIZED_IMAGE_RECV_BUFFER_SIZE,
-    _MAX_SIMILARITY_COMPUTE_WORKERS,
-    _PARALLEL_SIMILARITY_COMPUTE_THRESHOLD,
 )
 from vllm_ascend.distributed.ec_transfer.ssim import (
     build_patch_gray_plane,
@@ -45,7 +46,7 @@ class ResizedTensorLoadRequest:
 
 
 class MemcacheResizedTensorStore:
-    """Persist resized CPU tensors through a data-capable scheduler backend."""
+    """Persist resized tensors on their CPU/NPU device through the backend."""
 
     def __init__(
         self,
@@ -54,15 +55,9 @@ class MemcacheResizedTensorStore:
         model_id: str,
         recv_buffer_size: int = DEFAULT_RESIZED_IMAGE_RECV_BUFFER_SIZE,
     ) -> None:
-        if isinstance(recv_buffer_size, bool) or not isinstance(
-            recv_buffer_size, int
-        ):
+        if isinstance(recv_buffer_size, bool) or not isinstance(recv_buffer_size, int):
             raise ValueError("recv_buffer_size must be an integer")
-        if not (
-            MIN_RESIZED_IMAGE_RECV_BUFFER_SIZE
-            <= recv_buffer_size
-            <= MAX_RESIZED_IMAGE_RECV_BUFFER_SIZE
-        ):
+        if not (MIN_RESIZED_IMAGE_RECV_BUFFER_SIZE <= recv_buffer_size <= MAX_RESIZED_IMAGE_RECV_BUFFER_SIZE):
             raise ValueError(
                 "recv_buffer_size must be between "
                 f"{MIN_RESIZED_IMAGE_RECV_BUFFER_SIZE} and "
@@ -75,12 +70,15 @@ class MemcacheResizedTensorStore:
         self._model_identifier = quote(model_id, safe=".-_")
         self._recv_buffer_size = recv_buffer_size
         # Allocate and register lazily so a process that never has a similarity
-        # candidate does not reserve the configured host-memory capacity.
+        # candidate does not reserve the configured CPU/NPU memory capacity.
         self._recv_buffer: torch.Tensor | None = None
         self._recv_buffer_registered = False
         self._merge_size = merge_size
-        # Reuse CPU workers across pHash recall and SSIM scoring. The two
-        # phases are awaited sequentially, so one pool avoids idle duplicates.
+        # register_buffer uses shared pending state in MemcacheBackend.
+        # Keep registration alive for the entire PUT, including duplicate ptrs.
+        self._put_lock = Lock()
+        # Reuse CPU workers across SSIM batches. Device work stays on the
+        # calling thread so it retains the producer's current NPU stream.
         self._similarity_compute_executor = ThreadPoolExecutor(
             max_workers=_MAX_SIMILARITY_COMPUTE_WORKERS,
             thread_name_prefix="ec-similarity-compute",
@@ -110,9 +108,7 @@ class MemcacheResizedTensorStore:
         """Extract the original mm_hash from a versioned resized key."""
         if not key.startswith(_RESIZED_KEY_PREFIX):
             return None
-        mm_hash, separator, _ = key[len(_RESIZED_KEY_PREFIX) :].partition(
-            "_grid:"
-        )
+        mm_hash, separator, _ = key[len(_RESIZED_KEY_PREFIX) :].partition("_grid:")
         return mm_hash if separator and mm_hash else None
 
     @staticmethod
@@ -161,7 +157,7 @@ class MemcacheResizedTensorStore:
         key = self.get_resized_key(mm_hash, grid, tensor.shape, tensor.dtype)
         if self._backend.exists([key]) == [1]:
             return True
-        tensor = tensor.detach().to(device="cpu").contiguous()
+        tensor = tensor.detach().contiguous()
         if tensor.nbytes > MAX_RESIZED_IMAGE_TRANSFER_SIZE:
             logger.warning(
                 "EC resized tensor put skipped: key=%s bytes=%d max_bytes=%d",
@@ -171,20 +167,24 @@ class MemcacheResizedTensorStore:
             )
             return False
 
+        direction = self._transfer_direction(tensor.device, to_store=True)
+        # The external Memcache SDK cannot wait on a PyTorch producer stream.
+        self._synchronize_npu(tensor)
         tensor_ptr = tensor.data_ptr()
-        registered = False
-        try:
-            self._backend.register_buffer([tensor_ptr], [tensor.nbytes])
-            registered = True
-            result = self._backend.put_from(
-                key,
-                tensor_ptr,
-                tensor.nbytes,
-                MmcDirect.COPY_H2G.value,
-            )
-        finally:
-            if registered:
-                self._backend.unregister_buffer([tensor_ptr], [tensor.nbytes])
+        with self._put_lock:
+            registered = False
+            try:
+                self._backend.register_buffer([tensor_ptr], [tensor.nbytes])
+                registered = True
+                result = self._backend.put_from(
+                    key,
+                    tensor_ptr,
+                    tensor.nbytes,
+                    direction,
+                )
+            finally:
+                if registered:
+                    self._backend.unregister_buffer([tensor_ptr], [tensor.nbytes])
         if result != 0:
             logger.warning("EC resized tensor put failed: key=%s result=%s", key, result)
             return False
@@ -267,7 +267,7 @@ class MemcacheResizedTensorStore:
         ssim_threshold: float,
     ) -> list[tuple[float, str]]:
         """Return the first batch containing a qualified SSIM result."""
-        recv_buffer = self._ensure_recv_buffer()
+        recv_buffer = self._ensure_recv_buffer(current_resized_tensor.device)
         calculated_scores: list[tuple[float, str]] = []
         for regular_requests_batch in regular_requests_batches:
             local_request_batch = [
@@ -278,9 +278,7 @@ class MemcacheResizedTensorStore:
                 )
                 for local_index, request in enumerate(regular_requests_batch)
             ]
-            regular_batch_outputs: list[torch.Tensor | None] = [None] * len(
-                local_request_batch
-            )
+            regular_batch_outputs: list[torch.Tensor | None] = [None] * len(local_request_batch)
             self._load_batch_into_buffer(
                 local_request_batch,
                 regular_batch_outputs,
@@ -294,11 +292,12 @@ class MemcacheResizedTensorStore:
                 local_request_batch,
             )
             calculated_scores.extend(batch_scores)
-            max_score = max(score for score, _ in batch_scores)
-            if batch_scores and max_score > ssim_threshold:
+            calculated_scores.sort(key=lambda item: (-item[0], item[1]))
+            if batch_scores and max(score for score, _ in batch_scores) > ssim_threshold:
                 logger.debug(
-                    "EC similarity regular batch hit: ssim=%.6f threshold=%.6f",
-                    max_score,
+                    "EC similarity regular batch hit: candidate=%s ssim=%.6f threshold=%.6f",
+                    calculated_scores[0][1],
+                    calculated_scores[0][0],
                     ssim_threshold,
                 )
                 return calculated_scores
@@ -315,9 +314,7 @@ class MemcacheResizedTensorStore:
             return []
 
         temporary_buffer_size = max(
-            request.nbytes
-            for request_batch in oversized_requests_batches
-            for request in request_batch
+            request.nbytes for request_batch in oversized_requests_batches for request in request_batch
         )
         logger.warning(
             "EC resized tensors exceed the configured persistent receive "
@@ -329,7 +326,7 @@ class MemcacheResizedTensorStore:
         temporary_buffer = torch.empty(
             temporary_buffer_size,
             dtype=torch.uint8,
-            device="npu",
+            device=current_resized_tensor.device,
         )
         temporary_buffer_ptr = temporary_buffer.data_ptr()
         registered = False
@@ -347,13 +344,9 @@ class MemcacheResizedTensorStore:
                         resized_key=request.resized_key,
                         nbytes=request.nbytes,
                     )
-                    for local_index, request in enumerate(
-                        oversized_requests_batch
-                    )
+                    for local_index, request in enumerate(oversized_requests_batch)
                 ]
-                oversized_batch_outputs: list[torch.Tensor | None] = [
-                    None
-                ] * len(local_request_batch)
+                oversized_batch_outputs: list[torch.Tensor | None] = [None] * len(local_request_batch)
                 self._load_batch_into_buffer(
                     local_request_batch,
                     oversized_batch_outputs,
@@ -366,11 +359,12 @@ class MemcacheResizedTensorStore:
                     local_request_batch,
                 )
                 calculated_scores.extend(batch_scores)
-                max_score = max(score for score, _ in batch_scores)
-                if batch_scores and max_score > ssim_threshold:
+                calculated_scores.sort(key=lambda item: (-item[0], item[1]))
+                if batch_scores and max(score for score, _ in batch_scores) > ssim_threshold:
                     logger.debug(
-                        "EC similarity oversized batch hit: ssim=%.6f threshold=%.6f",
-                        max_score,
+                        "EC similarity oversized batch hit: candidate=%s ssim=%.6f threshold=%.6f",
+                        calculated_scores[0][1],
+                        calculated_scores[0][0],
                         ssim_threshold,
                     )
                     return calculated_scores
@@ -381,7 +375,6 @@ class MemcacheResizedTensorStore:
                     [temporary_buffer_ptr],
                     [temporary_buffer.nbytes],
                 )
-
 
     def calculate_ssim_results(
         self,
@@ -399,8 +392,8 @@ class MemcacheResizedTensorStore:
 
         score_resized_keys: list[str] = []
         score_tensors: list[torch.Tensor] = []
-        # Failed Memcache reads leave a None at the corresponding position and
-        # are not scored.
+        # Failed Memcache reads leave a None at the corresponding position
+        # and are not scored.
         for candidate_tensor, request in zip(candidate_tensors, request_batch):
             if candidate_tensor is None:
                 continue
@@ -422,7 +415,10 @@ class MemcacheResizedTensorStore:
         if current_gray_plane is None:
             return []
 
-        if candidate_count <= _PARALLEL_SIMILARITY_COMPUTE_THRESHOLD:
+        cpu_only = current_gray_plane.device.type == "cpu" and all(
+            tensor.device.type == "cpu" for tensor in score_tensors
+        )
+        if candidate_count <= _PARALLEL_SIMILARITY_COMPUTE_THRESHOLD or not cpu_only:
             logger.debug(
                 "EC similarity SSIM scoring: size=%d mode=serial",
                 candidate_count,
@@ -433,9 +429,7 @@ class MemcacheResizedTensorStore:
                     resized_key,
                     candidate_tensor,
                 )
-                for resized_key, candidate_tensor in zip(
-                    score_resized_keys, score_tensors
-                )
+                for resized_key, candidate_tensor in zip(score_resized_keys, score_tensors)
             ]
         else:
             logger.debug(
@@ -443,30 +437,30 @@ class MemcacheResizedTensorStore:
                 candidate_count,
                 min(candidate_count, _MAX_SIMILARITY_COMPUTE_WORKERS),
             )
-            score_results = list(
-                self._similarity_compute_executor.map(
+            futures = [
+                self._similarity_compute_executor.submit(
                     self._score_candidate,
-                    [current_gray_plane] * candidate_count,
-                    score_resized_keys,
-                    score_tensors,
+                    current_gray_plane,
+                    resized_key,
+                    candidate_tensor,
                 )
-            )
+                for resized_key, candidate_tensor in zip(score_resized_keys, score_tensors)
+            ]
+            # Finish all readers even if a task fails before releasing tensors.
+            wait(futures)
+            score_results = [future.result() for future in futures]
 
         return [result for result in score_results if result is not None]
-
 
     def _score_candidate(
         self,
         current_gray_plane: torch.Tensor,
         candidate_resized_key: str,
         candidate_tensor: torch.Tensor,
-
     ) -> tuple[float, str] | None:
 
         candidate_grid = self.get_grid_from_resized_key(candidate_resized_key)
-        candidate_mm_hash = self.get_mm_hash_from_resized_key(
-            candidate_resized_key
-        )
+        candidate_mm_hash = self.get_mm_hash_from_resized_key(candidate_resized_key)
         if candidate_grid is None or candidate_mm_hash is None:
             return None
         candidate_gray = build_patch_gray_plane(
@@ -481,15 +475,34 @@ class MemcacheResizedTensorStore:
             return None
         return score, candidate_mm_hash
 
+    @staticmethod
+    def _transfer_direction(device: torch.device, *, to_store: bool) -> int:
+        if device.type == "cpu":
+            return MmcDirect.COPY_H2G.value if to_store else MmcDirect.COPY_G2H.value
+        if device.type == "npu":
+            return MmcDirect.COPY_L2G.value if to_store else MmcDirect.COPY_G2L.value
+        raise ValueError(f"Unsupported EC resized tensor device: {device}")
 
-    def _ensure_recv_buffer(self) -> torch.Tensor:
+    @staticmethod
+    def _synchronize_npu(tensor: torch.Tensor) -> None:
+        if tensor.device.type == "npu":
+            torch.npu.current_stream(tensor.device).synchronize()
+
+    def _ensure_recv_buffer(self, device: torch.device) -> torch.Tensor:
+        self._transfer_direction(device, to_store=False)
         recv_buffer = self._recv_buffer
-        if recv_buffer is not None:
+        if recv_buffer is not None and recv_buffer.device == device:
             return recv_buffer
+        if recv_buffer is not None:
+            self._synchronize_npu(recv_buffer)
+            if self._recv_buffer_registered:
+                self._backend.unregister_buffer([recv_buffer.data_ptr()], [recv_buffer.nbytes])
+            self._recv_buffer = None
+            self._recv_buffer_registered = False
         recv_buffer = torch.empty(
             self._recv_buffer_size,
             dtype=torch.uint8,
-            device="npu",
+            device=device,
         )
         self._backend.register_buffer(
             [recv_buffer.data_ptr()],
@@ -517,11 +530,13 @@ class MemcacheResizedTensorStore:
             offset_bytes += request.nbytes
 
         base_addr = recv_buffer.data_ptr()
+        # Allocation/reuse may follow device work on the caller stream.
+        self._synchronize_npu(recv_buffer)
         results = self._backend.batch_get_into_buffers(
             [request.resized_key for request in request_batch],
             [base_addr + offset for offset in offsets],
             [request.nbytes for request in request_batch],
-            MmcDirect.COPY_G2L.value,
+            self._transfer_direction(recv_buffer.device, to_store=False),
         )
         if results is None or len(results) != len(request_batch):
             logger.warning(
@@ -533,24 +548,29 @@ class MemcacheResizedTensorStore:
 
         output_shape = tuple(current_resized_tensor.shape)
         output_dtype = current_resized_tensor.dtype
-        for request, offset, result in zip(
-            request_batch,
-            offsets,
-            results,
-        ):
-            if result == 0:
-                outputs[request.output_index] = (
-                    recv_buffer[offset : offset + request.nbytes]
-                    .view(output_dtype)
-                    .reshape(output_shape)
-                    .clone()
-                )
-            else:
-                logger.warning(
-                    "EC resized tensor get failed: key=%s result=%s",
-                    request.resized_key,
-                    result,
-                )
+        try:
+            for request, offset, result in zip(
+                request_batch,
+                offsets,
+                results,
+            ):
+                if result == 0:
+                    outputs[request.output_index] = (
+                        recv_buffer[offset : offset + request.nbytes]
+                        .view(output_dtype)
+                        .reshape(output_shape)
+                        .clone()
+                    )
+                else:
+                    logger.warning(
+                        "EC resized tensor get failed: key=%s result=%s",
+                        request.resized_key,
+                        result,
+                    )
+        finally:
+            # Device clones are asynchronous. Finish every queued read before
+            # the next SDK GET overwrites or unregisters this shared buffer.
+            self._synchronize_npu(recv_buffer)
         return
 
     @staticmethod
@@ -568,10 +588,7 @@ class MemcacheResizedTensorStore:
                     f"key={request.resized_key} bytes={request.nbytes} "
                     f"capacity_bytes={capacity_bytes}"
                 )
-            if (
-                current_batch
-                and current_bytes + request.nbytes > capacity_bytes
-            ):
+            if current_batch and current_bytes + request.nbytes > capacity_bytes:
                 batches.append(current_batch)
                 current_batch = []
                 current_bytes = 0
@@ -598,9 +615,7 @@ class MemcacheResizedTensorStore:
             )
 
         if oversized_requests:
-            temporary_buffer_size = max(
-                request.nbytes for request in oversized_requests
-            )
+            temporary_buffer_size = max(request.nbytes for request in oversized_requests)
             oversized_requests_batches = self._build_capacity_batches(
                 oversized_requests,
                 temporary_buffer_size,
@@ -612,6 +627,7 @@ class MemcacheResizedTensorStore:
         recv_buffer = self._recv_buffer
         if recv_buffer is None:
             return
+        self._synchronize_npu(recv_buffer)
         if self._recv_buffer_registered:
             self._backend.unregister_buffer(
                 [recv_buffer.data_ptr()],
@@ -619,4 +635,3 @@ class MemcacheResizedTensorStore:
             )
             self._recv_buffer_registered = False
         self._recv_buffer = None
-
