@@ -1,7 +1,24 @@
 # L2 pHash 优化与新版接口适配
 
+日期：2026-10-22。
+
+本次实现完整 pHash 直接检索与 8 band 倒排索引共用一份 resized key
+映射，并使 pHash、SSIM 和 resized tensor 传输跟随输入设备。
+
 本次迁移基于 L2 提交 `5fecef105`，保留 `956d74c83` 中的 pHash 检索优化。
-配置字段、默认值、Memcache key 格式均不变；未新增环境变量。
+
+## 1. 修改范围
+
+生产代码位于 `vllm_ascend/distributed/ec_transfer/`：
+
+| 文件 | 修改 |
+| --- | --- |
+| `perceptual_ssim_cache_matcher.py` | 增加 band 索引、零距离直查、复用批量检索、等待并行任务完成、设备输入留在调用线程、补齐最终 SSIM 阈值检查 |
+| `phash.py` | 输入设备上 FP32 计算、按设备缓存 DCT 常量、打包 8 字节结果、使用 `int.bit_count()` |
+| `ssim.py` | 输入设备上 FP32 计算、按设备缓存高斯核、拒绝不同设备之间隐式比较 |
+| `memcache_resized_tensor_store.py` | 去掉强制 CPU 搬移、匹配传输方向与缓冲区设备、保护外部拷贝和缓冲区复用、串行化 PUT 注册事务 |
+
+`ec_memcache_connector.py` 本身未修改。
 
 ## 检索行为
 
@@ -48,49 +65,3 @@ PUT 的注册、拷贝、注销由实例锁保护，防止重复指针或共享�
 
 CPU 任务使用线程池，全部任务结束后再传播错误；设备张量保留在调用线程，
 避免丢失调用方 NPU stream。没有新增 `tensor.item()` 热路径。
-
-## 验证记录与限制
-
-验证日期：2026-10-22。
-
-本次 Windows 验证环境没有 PyTorch，尚未执行完整 CPU 张量单测、NPU 测试或
-真实 Memcache 集成测试。
-
-写入前用现有 pytest 执行真实源码定义的控制流测试，mock 不可用的张量和
-外部服务边界。新版 L2 基线为 15 passed、14 failed；迁移候选为 29 passed。
-覆盖 0–7 汉明距离有序等价、禁止全表扫描、写入失败、批次去重、空分数、
-最佳候选与同分排序、阈值边界、请求偏移和错误后的任务等待。这不验证 DCT、
-SSIM 张量数值或 NPU DMA 正确性。
-
-相关完整测试已适配为新版请求结构，需在完整项目环境运行：
-
-```bash
-python -m pytest -q \
-  tests/ut/distributed/test_phash_tensor.py \
-  tests/ut/distributed/test_resized_tensor_devices.py \
-  tests/ut/distributed/test_perceptual_cache_matcher.py \
-  tests/ut/distributed/test_ec_memcache_connector.py
-```
-
-`bash format.sh ci` 已尝试，但因缺少 `pre-commit` 退出；当前环境也没有
-Ruff。语法检查及 Git whitespace 检查不能替代完整项目格式检查。
-
-提交合并前还需要验证真实 Ascend 非默认流、Memcache CPU/NPU 传输、缓冲区
-生命周期，以及同配置下的召回、时延和内存。应以新版 L2 为性能基线。
-
-## PR release note 草稿
-
-创建 PR 并获得编号后，在 `release_notes/fragments/<PR number>.yaml` 中按
-模板填写编号并纳入以下条目；本地迁移阶段不虚构 PR 编号。
-
-```yaml
-entries:
-  - category: performance
-    text: >-
-      Reduced perceptual encoder-cache lookup work with exact pHash lookup and
-      eight-band candidate recall while preserving candidate order.
-  - category: bugfix
-    text: >-
-      Preserved SSIM score ordering, handled empty score batches, and applied
-      consistent similarity thresholds during perceptual cache matching.
-```
