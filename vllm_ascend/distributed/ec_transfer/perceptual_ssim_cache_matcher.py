@@ -19,9 +19,9 @@ from vllm_ascend.distributed.ec_transfer.memcache_resized_tensor_store import (
 )
 from vllm_ascend.distributed.ec_transfer.phash import bands, compute_phash, hamming
 from vllm_ascend.distributed.ec_transfer.similarity_cache_config import (
+    SimilarityCacheConfig,
     _MAX_SIMILARITY_COMPUTE_WORKERS,
     _PARALLEL_SIMILARITY_COMPUTE_THRESHOLD,
-    SimilarityCacheConfig,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend import (
     MemcacheBackend,

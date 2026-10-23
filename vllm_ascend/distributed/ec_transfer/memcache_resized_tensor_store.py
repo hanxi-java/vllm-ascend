@@ -14,12 +14,12 @@ import torch
 from vllm.logger import logger
 
 from vllm_ascend.distributed.ec_transfer.similarity_cache_config import (
-    _MAX_SIMILARITY_COMPUTE_WORKERS,
-    _PARALLEL_SIMILARITY_COMPUTE_THRESHOLD,
     DEFAULT_RESIZED_IMAGE_RECV_BUFFER_SIZE,
     MAX_RESIZED_IMAGE_RECV_BUFFER_SIZE,
     MAX_RESIZED_IMAGE_TRANSFER_SIZE,
     MIN_RESIZED_IMAGE_RECV_BUFFER_SIZE,
+    _MAX_SIMILARITY_COMPUTE_WORKERS,
+    _PARALLEL_SIMILARITY_COMPUTE_THRESHOLD,
 )
 from vllm_ascend.distributed.ec_transfer.ssim import (
     build_patch_gray_plane,
@@ -392,8 +392,8 @@ class MemcacheResizedTensorStore:
 
         score_resized_keys: list[str] = []
         score_tensors: list[torch.Tensor] = []
-        # Failed Memcache reads leave a None at the corresponding position
-        # and are not scored.
+        # Failed Memcache reads leave a None at the corresponding position and
+        # are not scored.
         for candidate_tensor, request in zip(candidate_tensors, request_batch):
             if candidate_tensor is None:
                 continue

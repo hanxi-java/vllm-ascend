@@ -25,8 +25,8 @@ from functools import lru_cache
 import torch
 import torch.nn.functional as F
 
-_PHASH_SIZE = 32  # DCT 输入边长
-_HASH_SIDE = 8  # 取左上 8x8 低频 → 64 bit
+_PHASH_SIZE = 32    # DCT 输入边长
+_HASH_SIDE = 8      # 取左上 8x8 低频 → 64 bit
 # median 死区系数: |coef - median| <= _DEAD_ZONE * std 的位强制置 0
 _DEAD_ZONE = 0.05
 _DEVICE_CACHE_SIZE = 16

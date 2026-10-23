@@ -27,7 +27,7 @@ import torch.nn.functional as F
 
 _SSIM_K1 = 0.01
 _SSIM_K2 = 0.03
-_SSIM_WIN = 7  # 高斯窗边长; 实际取 min(win, gh, gw), 不足 3 放弃
+_SSIM_WIN = 7       # 高斯窗边长; 实际取 min(win, gh, gw), 不足 3 放弃
 _SSIM_SIGMA = 1.5
 _KERNEL_CACHE_SIZE = 64
 
