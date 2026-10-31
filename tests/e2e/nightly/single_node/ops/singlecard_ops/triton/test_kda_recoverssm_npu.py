@@ -693,7 +693,7 @@ def test_align_context(mode, graph_mode, state_dtype, heads, key_dim, value_dim,
 
             return invoke
 
-    for name in ["_commit_kda_state_kernel", "_commit_kda_state_grouped_kernel"]:
+    for name in ["_commit_recoverssm_state_kernel", "_commit_recoverssm_state_grouped_kernel"]:
         monkeypatch.setattr(recoverssm_module, name, RecordingKernel(name))
 
     def launch():
@@ -713,7 +713,7 @@ def test_align_context(mode, graph_mode, state_dtype, heads, key_dim, value_dim,
     else:
         launch()
     grouped = is_950() and state_dtype == torch.float32 and heads in (32, 64) and key_dim == value_dim == 128
-    fast_path = ("_commit_kda_state_grouped_kernel", False) if grouped else ("_commit_kda_state_kernel", False)
+    fast_path = ("_commit_recoverssm_state_grouped_kernel", False) if grouped else ("_commit_recoverssm_state_kernel", False)
     assert launches == {fast_path, (fast_path[0], True)}
     torch.testing.assert_close(
         context.state_commit_lens[:3] + context.boundary_commit_lens[:3], context.commit_lens[:3], atol=0, rtol=0
@@ -888,7 +888,7 @@ def test_commit_window_uses_device_path(
         originals.append((initial, conv.clone()))
     context = KDARecoverSSMCommitContext.create(layers, spec_query_len=span, max_num_reqs=batch)
     grouped_commit = is_950() and heads in (32, 64)
-    kernel_name = "_commit_kda_state_grouped_kernel" if grouped_commit else "_commit_kda_state_kernel"
+    kernel_name = "_commit_recoverssm_state_grouped_kernel" if grouped_commit else "_commit_recoverssm_state_kernel"
     original_kernel, launches = getattr(recoverssm_module, kernel_name), []
 
     class RecordingKernel:
