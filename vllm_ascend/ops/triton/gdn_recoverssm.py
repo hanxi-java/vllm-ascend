@@ -54,13 +54,14 @@ def _verify_kernel(
     L: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    FAST_DENSE: tl.constexpr,
 ):
     row, head, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     block = tl.load(Indices + row * stride_indices).to(tl.int64)
     bos = tl.load(Starts + row * stride_starts)
     eos = tl.load(Starts + (row + 1) * stride_starts)
     vv = tile * BV + tl.arange(0, BV)
-    if block <= 0:
+    if block < 0:
         # Capture/profile rows can have a non-empty query but a null page.
         # Keep their outputs deterministic without touching checkpoint/records.
         for pos in range(tl.minimum(eos - bos, L)):
@@ -71,26 +72,43 @@ def _verify_kernel(
     kh = head // (HV // HK)
     kk = tl.arange(0, BK)
     mask = (vv[:, None] < DV) & (kk[None, :] < DK)
-    state = tl.load(State + block * stride_s + head * DV * DK + vv[:, None] * DK + kk[None, :], mask=mask, other=0).to(
-        tl.float32
-    )
+    state_ptr = State + block * stride_s + head * DV * DK + vv[:, None] * DK + kk[None, :]
+    if FAST_DENSE:
+        state = tl.load(state_ptr).to(tl.float32)
+    else:
+        state = tl.load(state_ptr, mask=mask, other=0).to(tl.float32)
     for pos in range(tl.minimum(eos - bos, L)):
         token = bos + pos
-        q = tl.load(Q + token * stride_qt + kh * stride_qh + kk, kk < DK, 0).to(tl.float32)
-        k = tl.load(K + token * stride_kt + kh * stride_kh + kk, kk < DK, 0).to(tl.float32)
-        v = tl.load(V + token * stride_vt + head * stride_vh + vv, vv < DV, 0).to(tl.float32)
+        if FAST_DENSE:
+            q = tl.load(Q + token * stride_qt + kh * stride_qh + kk).to(tl.float32)
+            k = tl.load(K + token * stride_kt + kh * stride_kh + kk).to(tl.float32)
+            v = tl.load(V + token * stride_vt + head * stride_vh + vv).to(tl.float32)
+        else:
+            q = tl.load(Q + token * stride_qt + kh * stride_qh + kk, kk < DK, 0).to(tl.float32)
+            k = tl.load(K + token * stride_kt + kh * stride_kh + kk, kk < DK, 0).to(tl.float32)
+            v = tl.load(V + token * stride_vt + head * stride_vh + vv, vv < DV, 0).to(tl.float32)
         g = tl.load(G + token * stride_gt + head * stride_gh).to(tl.float32)
         beta = tl.load(Beta + token * stride_bt + head * stride_bh).to(tl.float32)
-        state = state * tl.exp(g)
+        decay = tl.exp(g)
+        state = state * decay
         delta = (v - tl.sum(state * k[None, :], 1)) * beta
         state = state + delta[:, None] * k[None, :]
         out = tl.sum(state * q[None, :], 1) * (DK**-0.5)
-        tl.store(Out + (token * HV + head) * DV + vv, out, vv < DV)
-        tl.store(Correction + block * stride_c + (head * L + pos) * DV + vv, delta, vv < DV)
+        if FAST_DENSE:
+            tl.store(Out + (token * HV + head) * DV + vv, out)
+            tl.store(Correction + block * stride_c + (head * L + pos) * DV + vv, delta)
+        else:
+            tl.store(Out + (token * HV + head) * DV + vv, out, vv < DV)
+            tl.store(Correction + block * stride_c + (head * L + pos) * DV + vv, delta, vv < DV)
         if tile == 0:
-            tl.store(Gates + block * stride_g + head * L + pos, g)
+            # Store the effective decay used by verification. Commit can then
+            # replay the exact value without evaluating exp() a second time.
+            tl.store(Gates + block * stride_g + head * L + pos, decay)
             if head % (HV // HK) == 0:
-                tl.store(Keys + block * stride_k + (kh * L + pos) * DK + kk, k, kk < DK)
+                if FAST_DENSE:
+                    tl.store(Keys + block * stride_k + (kh * L + pos) * DK + kk, k)
+                else:
+                    tl.store(Keys + block * stride_k + (kh * L + pos) * DK + kk, k, kk < DK)
 
 
 @triton.jit
@@ -123,7 +141,7 @@ def _commit_state_kernel(
     bos = tl.load(Starts + row * stride_starts)
     eos = tl.load(Starts + (row + 1) * stride_starts)
     count = tl.minimum(tl.maximum(tl.load(Accepted + request * stride_accepted), 0), tl.minimum(eos - bos, L))
-    if block <= 0 or count == 0:
+    if block < 0 or count == 0:
         return
     # Each page descriptor contains address and four strides. Record/state
     # inner layouts are dense; block strides may include allocator padding.
@@ -142,13 +160,19 @@ def _commit_state_kernel(
     address = state_ptr + block * ss + head * DV * DK + vv[:, None] * DK + kk[None, :]
     state = tl.load(address, mask, 0)
     kh = head // (HV // HK)
-    # Forward composition preserves verification's update order and avoids
-    # re-evaluating the state-dependent residual during accepted-state recovery.
-    for pos in range(count):
-        delta = tl.load(correction_ptr + block * cs + (head * L + pos) * DV + vv, vv < DV, 0)
-        key = tl.load(key_ptr + block * ks + (kh * L + pos) * DK + kk, kk < DK, 0)
-        gate = tl.load(gate_ptr + block * gs + head * L + pos)
-        state = state * tl.exp(gate) + delta[:, None] * key[None, :]
+    # Forward composition preserves verification's update order. The recorded
+    # gate is already the effective decay, so commit does not recompute exp().
+    if count == 1:
+        delta = tl.load(correction_ptr + block * cs + head * L * DV + vv, vv < DV, 0)
+        key = tl.load(key_ptr + block * ks + kh * L * DK + kk, kk < DK, 0)
+        gate = tl.load(gate_ptr + block * gs + head * L)
+        state = state * gate + delta[:, None] * key[None, :]
+    else:
+        for pos in range(count):
+            delta = tl.load(correction_ptr + block * cs + (head * L + pos) * DV + vv, vv < DV, 0)
+            key = tl.load(key_ptr + block * ks + (kh * L + pos) * DK + kk, kk < DK, 0)
+            gate = tl.load(gate_ptr + block * gs + head * L + pos)
+            state = state * gate + delta[:, None] * key[None, :]
     tl.store(address, state, mask)
 
 
@@ -177,15 +201,19 @@ def _commit_conv_kernel(
         request = tl.load(Requests + row * stride_requests)
     length = tl.load(Starts + (row + 1) * stride_starts) - tl.load(Starts + row * stride_starts)
     count = tl.minimum(tl.maximum(tl.load(Accepted + request * stride_accepted), 0), tl.minimum(length, L))
-    if block <= 0 or count == 0:
+    if block < 0 or count == 0:
         return
     desc = Pages + layer * GDN_PAGE_COUNT * PAGE_DESCRIPTOR_FIELDS
     conv = tl.load(desc).to(tl.pointer_type(ConvRef.dtype.element_ty))
     block_stride, dim_stride, token_stride = tl.load(desc + 1), tl.load(desc + 2), tl.load(desc + 3)
     channels = tile * BLOCK + tl.arange(0, BLOCK)
     base = conv + block * block_stride + channels * dim_stride
-    # Forward, channel-disjoint copies are safe for an overlapping left shift.
-    # 1D loads also support strided channels on A3's Triton backend.
+    # Shift the retained history left by the accepted prefix length.  This
+    # must also run for count == 1: an accepted token advances the window by
+    # one position, it is not an in-place copy.  Use a backward source offset
+    # so every source is read before its destination can be overwritten.
+    # The newest accepted convolution output is already present in the tail
+    # slots written by causal_conv1d_update.
     for pos in tl.static_range(HISTORY):
         values = tl.load(base + (count - 1 + pos) * token_stride, channels < CHANNELS, 0)
         tl.store(base + pos * token_stride, values, channels < CHANNELS)
@@ -235,6 +263,19 @@ def gdn_recoverssm_verify(
     if any(t.dtype not in (torch.int32, torch.int64) for t in (state_indices, query_start_loc)):
         raise ValueError("GDN RecoverSSM request metadata must use integer tensors")
     out = torch.empty_like(v, memory_format=torch.contiguous_format)
+    fast_dense = (
+        dk == 128
+        and dv == 128
+        and q.is_contiguous()
+        and k.is_contiguous()
+        and v.is_contiguous()
+        and g.is_contiguous()
+        and beta.is_contiguous()
+        and checkpoint.stride(0) == hv * dv * dk
+        and corrections.stride(0) == hv * spec_query_len * dv
+        and keys.stride(0) == hk * spec_query_len * dk
+        and gates.stride(0) == hv * spec_query_len
+    )
     if rows and tokens:
         _verify_kernel[(rows, hv, triton.cdiv(dv, 16))](
             q,
@@ -272,6 +313,7 @@ def gdn_recoverssm_verify(
             L=spec_query_len,
             BK=triton.next_power_of_2(dk),
             BV=16,
+            FAST_DENSE=fast_dense,
             num_warps=4,
             enable_fp_fusion=False,
         )
