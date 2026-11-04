@@ -1,3 +1,4 @@
+from pathlib import Path
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
@@ -68,3 +69,15 @@ def test_empty_commit_does_not_launch_and_align_is_rejected(monkeypatch):
         context.commit(empty, torch.ones(1, dtype=torch.int32), torch.tensor([0, 1]))
     with pytest.raises(ValueError, match="sampler mapping"):
         context.commit(empty, empty, starts, request_indices=torch.ones(1, dtype=torch.int32))
+
+
+def test_conv_compact_count_one_uses_shifted_history():
+    """The count=1 path must shift history instead of copying in place."""
+    source = """
+    for pos in tl.static_range(HISTORY):
+        values = tl.load(base + (count - 1 + pos) * token_stride, channels < CHANNELS, 0)
+        tl.store(base + pos * token_stride, values, channels < CHANNELS)
+    """
+    kernel = Path("vllm_ascend/ops/triton/gdn_recoverssm.py").read_text()
+    assert source.strip() in kernel
+    assert "if count == 1:\n        values = tl.load(base" not in kernel

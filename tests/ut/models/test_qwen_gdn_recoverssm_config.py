@@ -76,9 +76,8 @@ def test_target_geometry_and_model_layer_cache_agree(tp):
 @pytest.mark.parametrize(
     "section,field,value,message",
     [
-        ("speculative_config", "method", "eagle3", "requires MTP"),
-        ("speculative_config", "num_speculative_tokens", 0, "requires MTP"),
-        (None, "speculative_config", None, "requires MTP"),
+        ("speculative_config", "num_speculative_tokens", 0, "requires speculative decoding"),
+        (None, "speculative_config", None, "requires speculative decoding"),
         (None, "use_v2_model_runner", False, "Runner V2"),
         ("cache_config", "enable_prefix_caching", True, "prefix caching disabled"),
         ("cache_config", "mamba_cache_mode", "align", "cache mode none"),
@@ -97,6 +96,13 @@ def test_rejects_unsupported_execution_before_allocation(section, field, value, 
     config = make_config()
     setattr(getattr(config, section) if section else config, field, value)
     with pytest.raises(ValueError, match=message):
+        helpers["validate_qwen_gdn_recoverssm"](config)
+
+
+def test_speculative_methods_share_recoverssm_validation():
+    for method in ("mtp", "eagle3", "dspark"):
+        config = make_config()
+        config.speculative_config.method = method
         helpers["validate_qwen_gdn_recoverssm"](config)
 
 

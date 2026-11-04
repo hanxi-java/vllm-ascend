@@ -14,9 +14,60 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 
-def is_qwen_gdn_recoverssm_model(config: "VllmConfig") -> bool:
+_GDN_MODEL_TYPES = frozenset({
+    "qwen3_5_moe_text",
+    "qwen3_5_text",
+    "qwen3_next",
+})
+
+
+def is_gdn_model(config: "VllmConfig") -> bool:
+    """Return whether the model exposes the Qwen GDN geometry/configuration.
+
+    Keep this capability check local to the GDN path.  KDA's selector and
+    validation remain untouched, so adding another GDN model type cannot
+    change the KDA RecoverSSM path.
+    """
     model = config.model_config
-    return model is not None and model.hf_text_config.model_type == "qwen3_5_moe_text"
+    hf = getattr(model, "hf_text_config", None) if model is not None else None
+    if hf is None:
+        return False
+    model_type = getattr(hf, "model_type", None)
+    if model_type in _GDN_MODEL_TYPES:
+        return True
+    # Some Qwen derivatives use a custom model_type but retain the GDN
+    # configuration fields.  Do not classify arbitrary models without the
+    # complete set of GDN head fields.
+    return all(hasattr(hf, name) for name in (
+        "linear_num_key_heads",
+        "linear_num_value_heads",
+        "linear_key_head_dim",
+        "linear_value_head_dim",
+        "linear_conv_kernel_dim",
+    ))
+
+
+def gdn_geometry_supported(config: "VllmConfig") -> bool:
+    hf = config.model_config.hf_text_config
+    return (
+        getattr(hf, "linear_num_key_heads", None),
+        getattr(hf, "linear_num_value_heads", None),
+        getattr(hf, "linear_key_head_dim", None),
+        getattr(hf, "linear_value_head_dim", None),
+        getattr(hf, "linear_conv_kernel_dim", None),
+    ) == (16, 32, 128, 128, 4)
+
+
+def is_qwen_gdn_recoverssm_model(config: "VllmConfig") -> bool:
+    return is_gdn_model(config)
+
+
+def supports_gdn_recoverssm(config: "VllmConfig") -> bool:
+    return (
+        is_gdn_model(config)
+        and config.use_v2_model_runner
+        and gdn_geometry_supported(config)
+    )
 
 
 def use_qwen_gdn_recoverssm(config: "VllmConfig") -> bool:
@@ -25,8 +76,8 @@ def use_qwen_gdn_recoverssm(config: "VllmConfig") -> bool:
 
 def validate_qwen_gdn_recoverssm(config: "VllmConfig") -> None:
     spec = config.speculative_config
-    if spec is None or spec.method != "mtp" or spec.num_speculative_tokens < 1:
-        raise ValueError("Qwen GDN RecoverSSM requires MTP with at least one speculative token")
+    if spec is None or spec.num_speculative_tokens < 1:
+        raise ValueError("Qwen GDN RecoverSSM requires speculative decoding with at least one speculative token")
     if not config.use_v2_model_runner:
         raise ValueError("Qwen GDN RecoverSSM requires Model Runner V2")
     cache = config.cache_config
@@ -48,13 +99,7 @@ def validate_qwen_gdn_recoverssm(config: "VllmConfig") -> None:
     if config.kv_transfer_config is not None:
         raise ValueError("Qwen GDN RecoverSSM does not yet support KV transfer")
     hf = config.model_config.hf_text_config
-    if (
-        hf.linear_num_key_heads,
-        hf.linear_num_value_heads,
-        hf.linear_key_head_dim,
-        hf.linear_value_head_dim,
-        hf.linear_conv_kernel_dim,
-    ) != (16, 32, 128, 128, 4):
+    if not gdn_geometry_supported(config):
         raise ValueError("Qwen GDN RecoverSSM currently supports the Qwen3.6-35B-A3B GDN geometry")
     if 16 % parallel.tensor_parallel_size:
         raise ValueError("Qwen GDN RecoverSSM TP size must divide 16 key heads")
