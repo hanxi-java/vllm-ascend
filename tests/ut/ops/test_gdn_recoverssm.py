@@ -1,3 +1,4 @@
+from pathlib import Path
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
@@ -142,3 +143,15 @@ def test_align_window_and_metadata_constraints(monkeypatch):
         context.commit(*args, **{**align, "block_table": align["block_table"].float()})
     with pytest.raises(ValueError, match="cover the sampler rows"):
         context.commit(*args, **{**align, "num_computed_tokens": torch.empty(0, dtype=torch.int32)})
+
+
+def test_conv_compact_count_one_uses_shifted_history():
+    """The count=1 path must shift history instead of copying in place."""
+    source = """
+    for pos in tl.static_range(HISTORY):
+        values = tl.load(base + (count - 1 + pos) * token_stride, channels < CHANNELS, 0)
+        tl.store(base + pos * token_stride, values, channels < CHANNELS)
+    """
+    kernel = Path("vllm_ascend/ops/triton/gdn_recoverssm.py").read_text()
+    assert source.strip() in kernel
+    assert "if count == 1:\n        values = tl.load(base" not in kernel

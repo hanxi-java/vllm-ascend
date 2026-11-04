@@ -28,14 +28,12 @@ class _IndexFillMode(TorchFunctionMode):
         return func(*args, **kwargs)
 
 
-# vLLM main (#63421) replaced the torch.compile'd budget assignment with a
-# Triton kernel that no longer calls index_fill_, so the A5 workaround only
-# applies to the v0.32.0 allocator.
-if vllm_version_is("0.32.0"):
-    _original_assign_draft_token_budget = adaptive_verification._assign_draft_token_budget
+_original_assign_draft_token_budget = getattr(adaptive_verification, "_assign_draft_token_budget", None)
 
-    def _assign_draft_token_budget_ascend(*args, **kwargs):
-        with _IndexFillMode():
-            return _original_assign_draft_token_budget(*args, **kwargs)
+def _assign_draft_token_budget_ascend(*args, **kwargs):
+    with _IndexFillMode():
+        return _original_assign_draft_token_budget(*args, **kwargs)
 
+if _original_assign_draft_token_budget is not None:
     adaptive_verification._assign_draft_token_budget_compiled = _assign_draft_token_budget_ascend
+

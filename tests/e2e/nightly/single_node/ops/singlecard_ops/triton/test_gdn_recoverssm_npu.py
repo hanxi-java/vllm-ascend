@@ -80,6 +80,18 @@ def test_verify_and_multilayer_commit_preserve_accepted_prefix(monkeypatch, acce
                 q, k, v, g, beta, state, corrections, keys, gates, starts, indices, window
             )
             torch.testing.assert_close(observed.float(), expected, atol=3e-3, rtol=2e-2)
+            # RecoverSSM records the effective decay so commit replays the exact
+            # value instead of evaluating exp(g) a second time.
+            for row, block in enumerate(block_ids):
+                begin = starts[row].item()
+                length = starts[row + 1].item() - begin
+                expected_decay = g[0, begin : begin + length].float().exp().transpose(0, 1)
+                torch.testing.assert_close(
+                    gates[block, :, :length],
+                    expected_decay,
+                    atol=2e-3,
+                    rtol=2e-3,
+                )
             torch.testing.assert_close(state, initial, atol=0, rtol=0)
             final = initial.clone()
             conv_final = old_conv.clone()
