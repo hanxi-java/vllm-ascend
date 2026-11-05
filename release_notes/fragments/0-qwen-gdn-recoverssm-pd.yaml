@@ -1,0 +1,5 @@
+# Replace 0 with the assigned PR number before submitting this change.
+pr: 0
+entries:
+  - category: feature
+    text: Added experimental prefill/decode separation for Qwen GDN RecoverSSM with MooncakeConnectorV2 and MooncakePullConnector. Both peers must use matching TP sizes, speculative configurations, and RecoverSSM settings, with Mamba cache mode none and prefix caching disabled.

@@ -87,7 +87,7 @@ def test_target_geometry_and_model_layer_cache_agree(tp):
         ("parallel_config", "pipeline_parallel_size", 2, "PP=PCP=DCP=1"),
         ("parallel_config", "prefill_context_parallel_size", 2, "PP=PCP=DCP=1"),
         ("parallel_config", "decode_context_parallel_size", 2, "PP=PCP=DCP=1"),
-        (None, "kv_transfer_config", NS(), "KV transfer"),
+        (None, "kv_transfer_config", NS(kv_connector="AscendStoreConnector"), "requires Mooncake"),
     ],
 )
 def test_rejects_unsupported_execution_before_allocation(section, field, value, message):
@@ -104,13 +104,85 @@ def test_speculative_methods_share_recoverssm_validation():
         helpers["validate_qwen_gdn_recoverssm"](config)
 
 
-def test_target_selector_does_not_enable_other_architectures():
+@pytest.mark.parametrize("connector", ["MooncakeConnectorV2", "MooncakePullConnector"])
+@pytest.mark.parametrize("role", ["kv_producer", "kv_consumer"])
+@pytest.mark.parametrize("method", ["mtp", "dspark", "eagle3"])
+def test_pd_configuration_preserves_the_same_state_layout(connector, role, method):
     config = make_config()
-    for model_type in ("qwen3_next", "qwen3_5_text", "glm5_next_text", "kimi_k3"):
-        config.model_config.hf_text_config.model_type = model_type
-        assert not helpers["use_qwen_gdn_recoverssm"](config)
-    config.model_config.hf_text_config.model_type = "qwen3_5_moe_text"
+    config.speculative_config.method = method
+    config.parallel_config.tensor_parallel_size = 4
+    config.kv_transfer_config = NS(kv_connector=connector, kv_role=role)
+    helpers["validate_qwen_gdn_recoverssm"](config)
+
+    original = ((2048, 7), (8, 128, 128))
+    assert helpers["append_gdn_record_shapes"](original, 4, 5) == (
+        *original,
+        (8, 5, 128),
+        (4, 5, 128),
+        (8, 5),
+    )
+    assert helpers["append_gdn_record_dtypes"]((torch.bfloat16, torch.bfloat16)) == (
+        torch.bfloat16,
+        torch.float32,
+        torch.float32,
+        torch.float32,
+        torch.float32,
+    )
+
+
+@pytest.mark.parametrize("connector", ["AscendStoreConnector", "MooncakeLayerwiseConnector", "MultiConnector", None])
+def test_pd_rejects_connectors_without_the_supported_state_transfer_contract(connector):
+    config = make_config()
+    config.kv_transfer_config = NS(kv_connector=connector, kv_role="kv_consumer")
+    with pytest.raises(ValueError, match="requires MooncakeConnectorV2 or MooncakePullConnector"):
+        helpers["validate_qwen_gdn_recoverssm"](config)
+
+
+@pytest.mark.parametrize("connector", ["MooncakeConnectorV2", "MooncakePullConnector"])
+@pytest.mark.parametrize("role", ["kv_producer", "kv_consumer"])
+@pytest.mark.parametrize("cache_mode,prefix_caching", [("none", True), ("align", False), ("align", True)])
+def test_pd_requires_none_without_prefix_caching(connector, role, cache_mode, prefix_caching):
+    config = make_config()
+    config.cache_config.mamba_cache_mode = cache_mode
+    config.cache_config.enable_prefix_caching = prefix_caching
+    config.kv_transfer_config = NS(kv_connector=connector, kv_role=role)
+    with pytest.raises(ValueError, match="PD requires Mamba cache mode none and prefix caching disabled"):
+        helpers["validate_qwen_gdn_recoverssm"](config)
+
+
+@pytest.mark.parametrize("model_type", ["qwen3_next", "qwen3_5_text", "qwen3_5_moe_text"])
+def test_target_selector_enables_qwen_gdn_architectures(model_type):
+    config = make_config()
+    config.model_config.hf_text_config.model_type = model_type
+    assert helpers["supports_gdn_recoverssm"](config)
+    assert helpers["use_qwen_gdn_recoverssm"](config)
+    config.cache_config.use_replayssm = False
+    assert not helpers["use_qwen_gdn_recoverssm"](config)
+
+
+@pytest.mark.parametrize("model_type", ["glm5_next_text", "kimi_k3", "qwen3"])
+def test_target_selector_does_not_enable_models_without_gdn_fields(model_type):
+    config = make_config()
+    config.model_config.hf_text_config = NS(model_type=model_type)
+    assert not helpers["is_gdn_model"](config)
+    assert not helpers["supports_gdn_recoverssm"](config)
+    assert not helpers["use_qwen_gdn_recoverssm"](config)
+
+
+def test_target_selector_accepts_derivatives_only_with_complete_gdn_fields():
+    config = make_config()
+    config.model_config.hf_text_config.model_type = "custom_qwen_derivative"
+    assert helpers["supports_gdn_recoverssm"](config)
+    assert helpers["use_qwen_gdn_recoverssm"](config)
+    del config.model_config.hf_text_config.linear_conv_kernel_dim
+    assert not helpers["is_gdn_model"](config)
+    assert not helpers["use_qwen_gdn_recoverssm"](config)
+
+
+def test_target_selector_requires_supported_geometry():
+    config = make_config()
     config.model_config.hf_text_config.linear_num_key_heads = 8
+    assert not helpers["supports_gdn_recoverssm"](config)
     with pytest.raises(ValueError, match="geometry"):
         helpers["validate_qwen_gdn_recoverssm"](config)
 

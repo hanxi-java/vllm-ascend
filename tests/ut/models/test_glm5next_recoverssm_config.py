@@ -138,7 +138,9 @@ def test_other_models_and_disabled_switch_keep_upstream_validation(monkeypatch):
     assert called == [config, config]
 
 
-def test_qwen_selector_enables_shared_lifecycle_only_after_validation():
+@pytest.mark.parametrize("connector", [None, "MooncakeConnectorV2", "MooncakePullConnector"])
+@pytest.mark.parametrize("method", ["mtp", "dspark"])
+def test_qwen_selector_enables_shared_lifecycle_only_after_validation(connector, method):
     config = make_config()
     config.model_config.dtype = torch.bfloat16
     config.model_config.hf_text_config = SimpleNamespace(
@@ -149,15 +151,16 @@ def test_qwen_selector_enables_shared_lifecycle_only_after_validation():
         linear_value_head_dim=128,
         linear_conv_kernel_dim=4,
     )
-    config.speculative_config = SimpleNamespace(method="mtp", num_speculative_tokens=4)
+    config.speculative_config = SimpleNamespace(method=method, num_speculative_tokens=4)
+    if connector is not None:
+        config.kv_transfer_config = SimpleNamespace(kv_connector=connector, kv_role="kv_consumer")
     config.use_v2_model_runner = True
-    config.cache_config.mamba_ssm_cache_dtype = "float32"
+    config.cache_config.mamba_ssm_cache_dtype = "bfloat16"
     config.cache_config.mamba_cache_dtype = "auto"
     config.parallel_config.tensor_parallel_size = 4
-    config.cache_config.enable_prefix_caching = True
-    with pytest.raises(ValueError, match="prefix caching disabled"):
+    with pytest.raises(ValueError, match="FP32 SSM"):
         patch_replayssm_config.validate_mamba_cached_kernel(config)
     assert not config.cache_config.use_kda_recoverssm
-    config.cache_config.enable_prefix_caching = False
+    config.cache_config.mamba_ssm_cache_dtype = "float32"
     assert patch_replayssm_config.validate_mamba_cached_kernel(config) is config
     assert config.cache_config.use_kda_recoverssm

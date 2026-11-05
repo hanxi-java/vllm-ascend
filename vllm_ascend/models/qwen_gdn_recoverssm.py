@@ -14,11 +14,13 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 
-_GDN_MODEL_TYPES = frozenset({
-    "qwen3_5_moe_text",
-    "qwen3_5_text",
-    "qwen3_next",
-})
+_GDN_MODEL_TYPES = frozenset(
+    {
+        "qwen3_5_moe_text",
+        "qwen3_5_text",
+        "qwen3_next",
+    }
+)
 
 
 def is_gdn_model(config: "VllmConfig") -> bool:
@@ -38,13 +40,16 @@ def is_gdn_model(config: "VllmConfig") -> bool:
     # Some Qwen derivatives use a custom model_type but retain the GDN
     # configuration fields.  Do not classify arbitrary models without the
     # complete set of GDN head fields.
-    return all(hasattr(hf, name) for name in (
-        "linear_num_key_heads",
-        "linear_num_value_heads",
-        "linear_key_head_dim",
-        "linear_value_head_dim",
-        "linear_conv_kernel_dim",
-    ))
+    return all(
+        hasattr(hf, name)
+        for name in (
+            "linear_num_key_heads",
+            "linear_num_value_heads",
+            "linear_key_head_dim",
+            "linear_value_head_dim",
+            "linear_conv_kernel_dim",
+        )
+    )
 
 
 def gdn_geometry_supported(config: "VllmConfig") -> bool:
@@ -63,11 +68,7 @@ def is_qwen_gdn_recoverssm_model(config: "VllmConfig") -> bool:
 
 
 def supports_gdn_recoverssm(config: "VllmConfig") -> bool:
-    return (
-        is_gdn_model(config)
-        and config.use_v2_model_runner
-        and gdn_geometry_supported(config)
-    )
+    return is_gdn_model(config) and config.use_v2_model_runner and gdn_geometry_supported(config)
 
 
 def use_qwen_gdn_recoverssm(config: "VllmConfig") -> bool:
@@ -94,9 +95,12 @@ def validate_qwen_gdn_recoverssm(config: "VllmConfig") -> None:
         parallel.decode_context_parallel_size,
     ) != (1, 1, 1):
         raise ValueError("Qwen GDN RecoverSSM requires PP=PCP=DCP=1")
-    if config.kv_transfer_config is not None:
-        raise ValueError("Qwen GDN RecoverSSM does not yet support KV transfer")
-    hf = config.model_config.hf_text_config
+    transfer = config.kv_transfer_config
+    if transfer is not None:
+        if transfer.kv_connector not in ("MooncakeConnectorV2", "MooncakePullConnector"):
+            raise ValueError("Qwen GDN RecoverSSM KV transfer requires MooncakeConnectorV2 or MooncakePullConnector")
+        if cache.mamba_cache_mode != "none" or cache.enable_prefix_caching:
+            raise ValueError("Qwen GDN RecoverSSM PD requires Mamba cache mode none and prefix caching disabled")
     if not gdn_geometry_supported(config):
         raise ValueError("Qwen GDN RecoverSSM currently supports the Qwen3.6-35B-A3B GDN geometry")
     if 16 % parallel.tensor_parallel_size:
