@@ -61,6 +61,12 @@ from vllm.model_executor.models.vision import run_dp_sharded_mrope_vision_model
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFieldConfig
 
+from vllm_ascend.models.qwen_gdn_recoverssm import (
+    append_gdn_record_dtypes,
+    append_gdn_record_shapes,
+    use_qwen_gdn_recoverssm,
+)
+
 # Marker stored in the mm_kwargs dicts produced by select_encoder_cudagraph_items
 # once device-side preprocessing has been applied. The graph manager re-packs
 # sub-batches (and the DP path re-selects rank-local subsets), so without this
@@ -402,5 +408,26 @@ class AscendQwen3_5ForConditionalGeneration(_AscendVLPreprocessMixin, Qwen3_5For
     info=AscendQwen3_5MoeProcessingInfo,
     dummy_inputs=Qwen3VLDummyInputsBuilder,
 )
-class AscendQwen3_5MoeForConditionalGeneration(_AscendVLPreprocessMixin, Qwen3_5MoeForConditionalGeneration):
-    pass
+class AscendQwen3_5MoeForConditionalGeneration(
+    _AscendVLPreprocessMixin, Qwen3_5MoeForConditionalGeneration
+):
+    @classmethod
+    def get_mamba_state_shape_from_config(cls, config):
+        shapes = super().get_mamba_state_shape_from_config(config)
+        if not use_qwen_gdn_recoverssm(config):
+            return shapes
+        return append_gdn_record_shapes(
+            shapes,
+            config.model_config.hf_text_config.linear_num_key_heads
+            // config.parallel_config.tensor_parallel_size,
+            config.speculative_config.num_speculative_tokens + 1,
+        )
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(cls, config):
+        dtypes = super().get_mamba_state_dtype_from_config(config)
+        return (
+            append_gdn_record_dtypes(dtypes)
+            if use_qwen_gdn_recoverssm(config)
+            else dtypes
+        )

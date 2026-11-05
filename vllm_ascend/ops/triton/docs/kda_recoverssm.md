@@ -25,10 +25,11 @@
   reconstructs `next_state` through the accepted prefix from those records and
   the original checkpoint. Softplus uses its linear branch above 20.
 - **Algorithm flow** (independent requests and heads, with value-dimension tiles):
-  1. `_kda_recoverssm_verify_kernel` loads a request's checkpoint, advances a
-     register-held recurrence, writes outputs and compact records, and leaves the
-     persistent checkpoint unchanged. Null-page rows produce zero output and do
-     not write records.
+  1. `recoverssm_common._recoverssm_verify_kernel` selects the raw KDA input path
+     at compile time, loads a request's checkpoint, advances a register-held
+     recurrence, writes outputs and compact records, and leaves the persistent
+     checkpoint unchanged. Null-page rows produce zero output and do not write
+     records.
   2. `_prepare_commit_plan_kernel` maps speculative rows to sampler rows, clamps
      accepted lengths to the query length and window capacity, and prepares final
      and optional boundary destinations. Null pages and zero accepted lengths
@@ -36,9 +37,9 @@
   3. `_compact_conv_state_kernel` copies the accepted convolution history to its
      destination. For history length `W` and accepted length `c > 0`, the source
      interval is `[c - 1, c - 1 + W)` and the destination interval is `[0, W)`.
-  4. `_commit_kda_state_kernel` traverses the accepted records backwards,
+  4. `_commit_recoverssm_state_kernel` traverses the accepted records backwards,
      accumulates decay/products and correction outer products, and writes the
-     reconstructed recurrent checkpoint. `_commit_kda_state_grouped_kernel`
+     reconstructed recurrent checkpoint. `_commit_recoverssm_state_grouped_kernel`
      performs the same operation for two adjacent heads per program on its A5
      fast path. All aligned contexts use two disjoint on-device request filters
      to separate commits with and without a boundary snapshot. Non-crossing
@@ -50,6 +51,23 @@
   Operator validation is separate from model/worker integration. Serving
   configuration and restrictions are documented in the GLM RecoverSSM feature
   guide; low-level align arguments alone do not establish model support.
+
+KDA and GDN keep separate commit contexts and kernel launch strategies. Their
+shared `_prepare_commit_plan_kernel` in `recoverssm_common.py` directly loads
+request mappings and accepted lengths. Shared helpers copy convolution history
+(`_copy_conv_state_tile`) and load single-head correction/key/decay records
+(`_load_recoverssm_commit_record`). The record helper normalizes raw KDA keys
+and activates vector gates, while GDN uses its saved effective keys and scalar
+gates. KDA retains reverse accumulation, boundary recovery, and its separate
+grouped-head specialization. Both use reverse accumulation through the shared
+`_commit_recoverssm_state_kernel` and `_commit_recoverssm_state_grouped_kernel`.
+KDA and GDN import these kernels directly under their shared RecoverSSM names. GDN uses effective
+records and GQA key-head mapping; KDA retains raw-record normalization and gate
+activation. Both contexts use
+the shared `_prepare_commit_plan_kernel` and `_compact_conv_state_kernel`
+before their state kernel. GDN uses three launches in both `none` and `align`
+modes; KDA retains its separate boundary launch in align mode. Plan buffers are
+reused across steps without device-to-host synchronization.
 
 ## Parameters
 
