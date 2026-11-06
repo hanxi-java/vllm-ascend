@@ -168,3 +168,34 @@ def test_align_with_prefix_caching_is_supported():
     config.cache_config.mamba_cache_mode = "align"
     config.cache_config.enable_prefix_caching = True
     helpers["validate_qwen_gdn_recoverssm"](config)
+
+
+@pytest.mark.parametrize("cache_mode,prefix_caching", [("none", True), ("align", False)])
+def test_non_pd_rejects_cache_mode_prefix_caching_mismatch(cache_mode, prefix_caching):
+    config = make_config()
+    config.cache_config.mamba_cache_mode = cache_mode
+    config.cache_config.enable_prefix_caching = prefix_caching
+    with pytest.raises(ValueError, match="requires Mamba cache mode"):
+        helpers["validate_qwen_gdn_recoverssm"](config)
+
+
+@pytest.mark.parametrize("tp", [1, 4])
+def test_state_helpers_append_records_only_when_active(tp):
+    config = make_config()
+    config.parallel_config.tensor_parallel_size = tp
+    original = ((8192 // tp, 7), (32 // tp, 128, 128))
+    expected = (*original, (32 // tp, 5, 128), (16 // tp, 5, 128), (32 // tp, 5))
+    assert helpers["gdn_recoverssm_state_shapes"](original, config) == expected
+    assert helpers["gdn_recoverssm_state_dtypes"]((torch.bfloat16, torch.float32), config) == (
+        torch.bfloat16,
+        torch.float32,
+        torch.float32,
+        torch.float32,
+        torch.float32,
+    )
+    config.cache_config.use_replayssm = False
+    assert helpers["gdn_recoverssm_state_shapes"](original, config) == original
+    assert helpers["gdn_recoverssm_state_dtypes"]((torch.bfloat16, torch.float32), config) == (
+        torch.bfloat16,
+        torch.float32,
+    )

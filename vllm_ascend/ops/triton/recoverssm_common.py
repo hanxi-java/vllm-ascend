@@ -129,7 +129,7 @@ def _prepare_commit_plan_kernel(
     if ALIGN_MODE:
         num_computed = tl.load(num_computed_ptr + request_idx * stride_num_computed).to(tl.int32)
         final_num_computed = num_computed + commit_len
-        final_state_col = tl.minimum(final_num_computed // mamba_block_size, block_table_width - 1)
+        final_state_col = tl.minimum(tl.maximum(final_num_computed - 1, 0) // mamba_block_size, block_table_width - 1)
         final_state_idx = tl.load(
             block_table_ptr + request_idx * stride_block_table_row + final_state_col * stride_block_table_col
         ).to(tl.int64)
@@ -216,7 +216,8 @@ def _compact_conv_state_kernel(
 
     boundary_ptr = None
     if ALIGN_MODE:
-        boundary_ptr = conv_state_ptr + boundary_state_idx * block_stride
+        # Clamp the address only; access masks still key off the raw index.
+        boundary_ptr = conv_state_ptr + tl.maximum(boundary_state_idx, 0) * block_stride
 
     if USE_1D_CHANNEL_GATHER and (DIM_STRIDE is not None and DIM_STRIDE != 1):
         # A3 Triton 3.2 requires one-dimensional gathers for strided channels.
@@ -811,7 +812,7 @@ def _commit_recoverssm_state_kernel(
     if ALIGN_MODE:
         boundary_ptrs = (
             state_ptr
-            + boundary_state_idx * state_block_stride
+            + tl.maximum(boundary_state_idx, 0) * state_block_stride
             + pid_h * stride_state_head
             + offs_v[:, None] * stride_state_v
             + offs_k[None, :] * stride_state_k

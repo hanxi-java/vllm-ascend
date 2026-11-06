@@ -78,6 +78,17 @@ def validate_qwen_gdn_recoverssm(config: "VllmConfig") -> None:
     if transfer is not None:
         if transfer.kv_connector not in ("MooncakeConnectorV2", "MooncakePullConnector"):
             raise ValueError("Qwen GDN RecoverSSM KV transfer requires MooncakeConnectorV2 or MooncakePullConnector")
+        if cache.mamba_cache_mode != "none" or cache.enable_prefix_caching:
+            raise ValueError("Qwen GDN RecoverSSM PD requires Mamba cache mode none and prefix caching disabled")
+    else:
+        expected_cache_mode = "align" if cache.enable_prefix_caching else "none"
+        if cache.mamba_cache_mode != expected_cache_mode:
+            raise ValueError(
+                f"Qwen GDN RecoverSSM requires Mamba cache mode {expected_cache_mode} "
+                "with this prefix caching setting"
+            )
+    if 16 % parallel.tensor_parallel_size:
+        raise ValueError("Qwen GDN RecoverSSM TP size must divide 16 key heads")
 
 def append_gdn_record_shapes(shapes, num_key_heads: int, spec_query_len: int):
     """Append correction, effective key and log-decay records to conv/state."""
@@ -93,3 +104,28 @@ def append_gdn_record_shapes(shapes, num_key_heads: int, spec_query_len: int):
 def append_gdn_record_dtypes(dtypes):
     # Force the checkpoint to FP32 even when an unresolved "auto" reached us.
     return (dtypes[0], torch.float32, torch.float32, torch.float32, torch.float32)
+
+
+def gdn_recoverssm_state_shapes(shapes, config: "VllmConfig"):
+    """Append RecoverSSM record pages when the feature is active."""
+    if not use_qwen_gdn_recoverssm(config):
+        return shapes
+    return append_gdn_record_shapes(
+        shapes,
+        config.model_config.hf_text_config.linear_num_key_heads // config.parallel_config.tensor_parallel_size,
+        config.speculative_config.num_speculative_tokens + 1,
+    )
+
+
+def gdn_recoverssm_state_dtypes(dtypes, config: "VllmConfig"):
+    return append_gdn_record_dtypes(dtypes) if use_qwen_gdn_recoverssm(config) else dtypes
+
+
+class QwenGDNRecoverSSMModelMixin:
+    @classmethod
+    def get_mamba_state_shape_from_config(cls, config):
+        return gdn_recoverssm_state_shapes(super().get_mamba_state_shape_from_config(config), config)
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(cls, config):
+        return gdn_recoverssm_state_dtypes(super().get_mamba_state_dtype_from_config(config), config)

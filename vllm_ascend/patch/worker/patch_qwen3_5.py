@@ -23,7 +23,7 @@ import torch
 from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention as _GDNBaseCls
-from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer
+from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM
 
 try:
     from vllm.model_executor.models.qwen3_5_mtp import Qwen3_5MultiTokenPredictor
@@ -31,10 +31,14 @@ try:
 except ImportError:
     Qwen3_5MultiTokenPredictor = None
     IntermediateTensors = None
-from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
+from vllm.model_executor.models.qwen3_next import Qwen3NextAttention, Qwen3NextForCausalLM
 
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
-from vllm_ascend.models.qwen_gdn_recoverssm import use_qwen_gdn_recoverssm
+from vllm_ascend.models.qwen_gdn_recoverssm import (
+    gdn_recoverssm_state_dtypes,
+    gdn_recoverssm_state_shapes,
+    use_qwen_gdn_recoverssm,
+)
 from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention, initialize_packed_conv_weight
 
 _GDN_PATCH_TARGET = _GDNBaseCls
@@ -204,6 +208,32 @@ if Qwen3_5MultiTokenPredictor is not None:
 
 
 Qwen3NextAttention.forward = AscendQwen3NextAttention.forward
+
+
+def _patch_gdn_model_state_classmethods(target):
+    # Upstream text GDN classes cannot inherit the Ascend mixin, so extend
+    # their mamba state classmethods in place.
+    if getattr(target, "_gdn_recoverssm_state_patched", False):
+        return
+    orig_shape = target.get_mamba_state_shape_from_config
+    orig_dtype = target.get_mamba_state_dtype_from_config
+
+    @classmethod
+    def get_mamba_state_shape_from_config(cls, config):
+        return gdn_recoverssm_state_shapes(orig_shape(config), config)
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(cls, config):
+        return gdn_recoverssm_state_dtypes(orig_dtype(config), config)
+
+    target.get_mamba_state_shape_from_config = get_mamba_state_shape_from_config
+    target.get_mamba_state_dtype_from_config = get_mamba_state_dtype_from_config
+    target._gdn_recoverssm_state_patched = True
+
+
+for _model_cls in (Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM, Qwen3NextForCausalLM):
+    _patch_gdn_model_state_classmethods(_model_cls)
+
 _GDN_PATCH_TARGET._split_ba_for_tp = AscendGatedDeltaNetAttention._split_ba_for_tp
 _GDN_PATCH_TARGET.get_state_shape = AscendGatedDeltaNetAttention.get_state_shape
 _GDN_PATCH_TARGET.get_state_dtype = AscendGatedDeltaNetAttention.get_state_dtype

@@ -38,6 +38,8 @@ RECOVERSSM_COMMIT_UB_HEADROOM_ROWS = 2
 RECOVERSSM_VALUE_TILE = 64
 RECOVERSSM_VALUE_TILE_LARGE = 128
 RECOVERSSM_LARGE_TILE_MIN_PROGRAMS = 96
+RECOVERSSM_CONV_TILE = 4096
+RECOVERSSM_CONV_STRIDED_TILE = 256
 
 
 def _inner_stride_signature(tensor):
@@ -493,7 +495,12 @@ class GDNRecoverSSMCommitContext:
             num_warps=1,
         )
         # 2. Copy final and optional boundary convolution histories.
-        conv_block = 128
+        # Strided channel gathers need smaller tiles to fit the A3 UB.
+        conv_block = (
+            RECOVERSSM_CONV_TILE
+            if is_950() or self.conv_shared_dim_stride == 1
+            else RECOVERSSM_CONV_STRIDED_TILE
+        )
         conv_cache_address_stride_table = self._conv_cache_address_stride_table
         num_layers = len(self.layer_caches)
         _compact_conv_state_kernel[(triton.cdiv(conv.shape[1], conv_block), batch, num_layers)](
